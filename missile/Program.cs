@@ -95,69 +95,88 @@ namespace IngameScript
         /// optional drag, and a maximum speed clamp.
         /// </summary>
         Vector3D SimulateBombDrop(
-    Vector3D initialPosition,
-    Vector3D initialVelocity,
-    IMyRemoteControl remoteControl,
-    double timeStep,
-    double maxTime,
-    Vector3D targetPosition,
-    double impactThreshold,
-    double steerStrength,
-    double maxSteerAngleDeg,
-    double dragCoefficient,
-    double maxSpeed
-)
+            Vector3D initialPosition,
+            Vector3D initialVelocity,
+            IMyRemoteControl remoteControl,
+            double timeStep,
+            double maxTime,
+            Vector3D targetPosition,
+            double impactThreshold,
+            double dragCoefficient
+        )
         {
+            double steerStrength = 0.2; // Reduced for smoother control
+            double maxSteerAngleDeg = 5.0; // Prevent oversteering
+            double estimatedGlideDistance = 690.9; // Computed from previous experiments
+
             Vector3D position = initialPosition;
             Vector3D velocity = initialVelocity;
-            double time = 0;
+            Vector3D tailDirection = -Vector3D.Normalize(velocity); // Track "ass-first" orientation
+
+            double time = 0.0;
             double closestDistance = double.MaxValue;
             Vector3D closestPosition = position;
 
             while (time < maxTime)
             {
-                // Get the gravity vector from the remote control.
+                // Gravity
                 Vector3D gravity = remoteControl.GetNaturalGravity();
 
-                // Apply gravity to velocity.
-                velocity += gravity * timeStep;
+                // Compute speed
+                double speed = velocity.Length();
+                Vector3D velocityDir = (speed > 1e-6) ? Vector3D.Normalize(velocity) : Vector3D.Zero;
 
-                // Apply optional drag if desired.
-                if (dragCoefficient > 0)
+                // Compute target direction
+                Vector3D targetDirection = Vector3D.Normalize(targetPosition - position);
+
+                // Use tail direction for steer calculation
+                double angleToTarget = CalculateAngleBetween(tailDirection, targetDirection) * (180.0 / Math.PI);
+                if (angleToTarget > maxSteerAngleDeg)
                 {
-                    double speed = velocity.Length();
-                    if (speed > 1e-4)
-                    {
-                        // Quadratic drag: drag force ~ velocity * speed
-                        Vector3D drag = -dragCoefficient * speed * velocity;
-                        velocity += drag * timeStep;
-                    }
+                    targetDirection = Vector3D.Lerp(tailDirection, targetDirection, steerStrength * timeStep);
+                    targetDirection = Vector3D.Normalize(targetDirection);
                 }
 
-                // Update the projectile’s position.
+                // Update bomb tail orientation smoothly
+                tailDirection = Vector3D.Lerp(tailDirection, targetDirection, steerStrength * timeStep);
+                tailDirection = Vector3D.Normalize(tailDirection);
+
+                // Orientation-based drag (favor "ass-first" stability)
+                double alignmentFactor = Math.Max(0.2, Vector3D.Dot(tailDirection, velocityDir)); // Prevent complete stall
+                Vector3D dragAccel = -dragCoefficient * speed * speed * alignmentFactor * velocityDir;
+
+                // Apply forces
+                velocity += (gravity + dragAccel) * timeStep;
+                velocity = Vector3D.Normalize(velocity) * speed; // Maintain speed but adjust direction
+
+                // Update position
                 Vector3D nextPosition = position + velocity * timeStep;
 
-                // Check if we have come close enough to the target to consider it an impact.
-                double finalDistance = Vector3D.Distance(nextPosition, targetPosition);
-                if (finalDistance < impactThreshold)
+                // Adjust impact radius estimate
+                double currentGlideRadius = estimatedGlideDistance * (speed / maxTime);
+                if (Vector3D.Distance(nextPosition, initialPosition) > currentGlideRadius)
                 {
-                    // Return the point of impact.
+                    return nextPosition; // Ensure the bomb stays within expected impact zone
+                }
+
+                // Check for impact
+                double dist = Vector3D.Distance(nextPosition, targetPosition);
+                if (dist < impactThreshold)
+                {
                     return nextPosition;
                 }
 
-                // Update the closest distance and position
-                if (finalDistance < closestDistance)
+                // Track closest approach
+                if (dist < closestDistance)
                 {
-                    closestDistance = finalDistance;
+                    closestDistance = dist;
                     closestPosition = nextPosition;
                 }
 
-                // Update for next iteration.
                 position = nextPosition;
                 time += timeStep;
             }
 
-            // If maxTime is reached without hitting the target, return the closest position.
             return closestPosition;
         }
 
@@ -167,8 +186,8 @@ namespace IngameScript
             Vector3D bombPosition = _remoteControl.GetPosition();
             Vector3D bombVelocity = _remoteControl.GetShipVelocities().LinearVelocity;
             Vector3D gravity = _remoteControl.GetNaturalGravity();
-            Vector3D predictedImpact = SimulateBombDrop(bombPosition, bombVelocity, _remoteControl, 0.1, 200, targetPosition, 2.0, 1, 5.0, 0.3, 330);
-            double distanceToTarget = Vector3D.Distance(predictedImpact, targetPosition);
+            Vector3D predictedImpact = SimulateBombDrop(bombPosition, bombVelocity, _remoteControl, 0.1, 200, targetPosition, 2.0, 0.001);
+            double distanceToTarget = Vector3D.Distance(predictedImpact, targetPosition) / 2;
 
 
             programmableBlock = GridTerminalSystem.GetBlockWithName("JETOS Programmable Block") as IMyProgrammableBlock;
@@ -348,8 +367,9 @@ namespace IngameScript
             // How often to log (in calls to GetPointingVector).
             private readonly IMyRemoteControl _remoteControl;
             // Simple counter to know when it's time to log.
-            private int _tickCounter = 0;
-
+            public int _tickCounter;
+            public Vector3D previousForward;
+            private bool _initialVelocityLogged = false;
             // A buffer that accumulates the log lines in memory.
             private readonly List<string> _logEntries = new List<string>();
 
@@ -365,8 +385,18 @@ namespace IngameScript
                 : base(updatesPerSecond, navConstant, remoteControl, navAccelConstant)
             {
                 _remoteControl = remoteControl;
+                _tickCounter = 0;
             }
+            double CalculateAngleBetween(Vector3D v1, Vector3D v2)
+            {
+                double dot = Vector3D.Dot(v1, v2);
+                double magProduct = v1.Length() * v2.Length();
 
+                if (magProduct < 1e-6) return 0; // Avoid division by zero
+
+                double cosTheta = MathHelper.Clamp(dot / magProduct, -1.0, 1.0); // Clamp to avoid NaN issues
+                return Math.Acos(cosTheta) * (180.0 / Math.PI); // Convert to degrees
+            }
             /// <summary>
             /// Overridden so that we only return lateral drag guidance,
             /// not forward thrust or direct gravity compensation.
@@ -419,13 +449,48 @@ namespace IngameScript
                 // Combine them:
                 Vector3D totalAcceleration = lateralAcceleration + gravityComp;
 
-                // Possibly log some data
-                _tickCounter++;
-                if (_tickCounter % 10 == 0)
+                // --- Logging System ---
+                if (!_initialVelocityLogged)
                 {
-                    _logEntries.Add($"Dist={missileToTarget.Length():F2}  latAccel={lateralAcceleration.Length():F2}");
+                    _initialVelocityLogged = true;
+                    double initSpeed = missileVelocity.Length();
+                    _logEntries.Add(
+                        $"[Tick={_tickCounter}] InitialVelocity={initSpeed:F2} m/s " +
+                        $"Vector=({missileVelocity.X:F2}, {missileVelocity.Y:F2}, {missileVelocity.Z:F2})"
+                    );
                 }
 
+                // Log key values every 60 ticks
+                if (_tickCounter % 60 == 0)
+                {
+                    double dist = missileToTarget.Length();
+                    double latAccelMag = lateralAcceleration.Length();
+                    double totalAccelMag = totalAcceleration.Length();
+                    double missileSpeed = missileVelocity.Length();
+                    double gravMag = gravity.Length();
+                    double timeElapsed = _tickCounter / UpdatesPerSecond; // Convert to seconds
+                    // Compute current steer angle (angle between forward direction & target)
+                    double steerAngle = Math.Acos(Vector3D.Dot(_remoteControl.WorldMatrix.Forward, Vector3D.Normalize(missileToTarget))) * (180.0 / Math.PI);
+
+                    // Compute steer strength effectiveness (change in orientation per tick)
+                    double steerEffectiveness = CalculateAngleBetween(previousForward, _remoteControl.WorldMatrix.Forward) * (180.0 / Math.PI);
+
+                    _logEntries.Add(
+                        $"[Tick={_tickCounter}]" +
+                        $"Dist={dist:F2}m  BSpd={missileSpeed:F2}m/s  " +
+                        $"LatAccel={latAccelMag:F2}m/s²  TtlAccl={totalAccelMag:F2}m/s²  " +
+                        $"GMag={gravMag:F2}m/s²  " +
+                        $"BPos=({missilePosition.X:F2}, {missilePosition.Y:F2}, {missilePosition.Z:F2})  " +
+                        $"RlVel=({relativeVelocity.X:F2}, {relativeVelocity.Y:F2}, {relativeVelocity.Z:F2})  " +
+                        $"SteerAngle={steerAngle:F2}°  SteerEffect={steerEffectiveness:F2}°/tick"
+                    );
+
+                    // Update previous forward direction for next tick comparison
+                    previousForward = _remoteControl.WorldMatrix.Forward;
+                }
+
+                _tickCounter++;
+                
                 return totalAcceleration;
             }
 
@@ -683,12 +748,14 @@ namespace IngameScript
                     missileAcceleration = 0;
                     // Update the guidance
                     var logEntries = _bombDragProNavGuidance.LogEntries;
-                    int maxDisplay = Math.Min(300, logEntries.Count);
-
+                    int maxDisplay = Math.Min(40, logEntries.Count);
+                    string base64Encoded = "";
                     for (int i = 0; i < maxDisplay; i++)
                     {
-                        Echo(logEntries[i]);
+                        base64Encoded += logEntries[i];
+                        
                     }
+                    Echo(Convert.ToBase64String(Encoding.UTF8.GetBytes(base64Encoded)));
                     desiredAcceleration = _bombDragProNavGuidance.Update(
                         missilePosition: _remoteControl.GetPosition(),
                         missileVelocity: currentVelocity,
