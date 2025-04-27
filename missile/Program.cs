@@ -1,4 +1,6 @@
-﻿using Sandbox.Game.EntityComponents;
+﻿using Sandbox.Game.Entities;
+using Sandbox.Game.EntityComponents;
+using Sandbox.Game.Lights;
 using Sandbox.ModAPI.Ingame;
 using Sandbox.ModAPI.Interfaces;
 using SpaceEngineers.Game.ModAPI.Ingame;
@@ -61,7 +63,6 @@ namespace IngameScript
         const double DETONATION_DISTANCE = 8.0;
         const float tickTime = 1f / 60f;
         ProNavGuidance _proNavGuidance;
-        BombDragProNavGuidance _bombDragProNavGuidance;
         double _navConstant = 5.0;
         bool isTopdown = false;
         List<Vector3D> _waypoints = new List<Vector3D>();
@@ -231,11 +232,6 @@ namespace IngameScript
 
             // Smoothing factor (from Script B, value was 0.8)
             // Override ClearTargetAccelerationData to also clear smoothing history
-            public new void ClearTargetAccelerationData()
-            {
-                _previousSmoothedRelativeVelocity = Vector3D.Zero;
-                _hasSmoothedOnce = false;
-            }
             public GuidanceBase(double updatesPerSecond)
             {
                 UpdatesPerSecond = updatesPerSecond;
@@ -246,43 +242,24 @@ namespace IngameScript
             {
                 _lastVelocity = null;
             }
-
-            public Vector3D Update(
-                Vector3D missilePosition,
-                Vector3D missileVelocity,
-                double missileAcceleration,
-                Vector3D targetPosition,
-                Vector3D targetVelocity,
-                Vector3D targetAcceleration,
-                Vector3D naturalGravity) // Pass gravity as an input
+            public Vector3D CalculateControlVector(Vector3D currentPosition, Vector3D currentVelocity, double maxAcceleration, Vector3D targetPosition, Vector3D targetVelocity, Vector3D targetAcceleration, Vector3D gravityVector) // Å(v, w, x, y, z, ª, µ)
             {
-                Vector3D targetAccel = Vector3D.Zero;
-
+                Vector3D derivativeTerm = Vector3D.Zero; // º
                 if (_lastVelocity.HasValue)
-                    targetAccel = (targetVelocity - _lastVelocity.Value) * UpdatesPerSecond;
+                {
+                    // D part of PID? (z - s.Value) seems like change in targetVelocity if z is targetVelocity
+                    derivativeTerm = (targetVelocity - _lastVelocity.Value) * UpdatesPerSecond;
+                }
+                _previousSmoothedRelativeVelocity = targetVelocity;
 
-                _lastVelocity = targetVelocity;
-
-                // Gravity compensation
-                Vector3D gravityCompensation = -naturalGravity;
-
-                Vector3D cmdAccel = GetPointingVector(
-                        missilePosition, missileVelocity, missileAcceleration,
-                        targetPosition, targetVelocity, targetAccel,
-                        naturalGravity);                 
-
-                return cmdAccel;
+                Vector3D gravityCompensation = -gravityVector; // À = -µ
+                Vector3D desiredAcceleration = CalculateDesiredAcceleration(currentPosition, currentVelocity, maxAcceleration, targetPosition, targetVelocity, derivativeTerm); // Â = Á(...)
+                return Vector3D.Normalize(desiredAcceleration + gravityCompensation); // Ã.Ä(Â + À)
             }
 
+            // Abstract method for the core acceleration calculation
+            public abstract Vector3D CalculateDesiredAcceleration(Vector3D currentPosition, Vector3D currentVelocity, double maxAcceleration, Vector3D targetPosition, Vector3D targetVelocity, Vector3D derivativeTerm); // Á(v, w, x, y, z, ª)
 
-            public abstract Vector3D GetPointingVector(
-        Vector3D missilePosition,
-        Vector3D missileVelocity,
-        double missileAcceleration,
-        Vector3D targetPosition,
-        Vector3D targetVelocity,
-        Vector3D targetAcceleration,
-        Vector3D gravity);
         }
 
 
@@ -290,264 +267,68 @@ namespace IngameScript
         {
             public double NavConstant;
             public double NavAccelConstant;
-            private Vector3D _previousSmoothedRelativeVelocity = Vector3D.Zero;
-            private bool _hasSmoothedOnce = false; // Flag to handle first calculation
 
-            // Smoothing factor (from Script B, value was 0.8)
-            private const double SMOOTHING_FACTOR = 0.8;
-            // Override ClearTargetAccelerationData to also clear smoothing history
-            public new void ClearTargetAccelerationData()
+            public RelNavGuidance(double timeConstant, double proportionalGain, double derivativeGain = 0) : base(timeConstant) // Ê(o, È, É=0)
             {
-                base.ClearTargetAccelerationData(); // Call base method
-                _previousSmoothedRelativeVelocity = Vector3D.Zero;
-                _hasSmoothedOnce = false;
+                NavConstant = proportionalGain;
+                NavAccelConstant = derivativeGain;
             }
-            public RelNavGuidance(double updatesPerSecond, double navConstant, double navAccelConstant = 0)
-                : base(updatesPerSecond)
+            public override Vector3D CalculateDesiredAcceleration(Vector3D currentPosition, Vector3D currentVelocity, double maxAcceleration, Vector3D targetPosition, Vector3D targetVelocity, Vector3D derivativeTerm) // Á(v, w, x, y, z, ª)
             {
-                NavConstant = navConstant;
-                NavAccelConstant = navAccelConstant;
+                Vector3D positionError = targetPosition - currentPosition; // Ë = y - v
+                Vector3D directionToTarget = Vector3D.Normalize(positionError); // Ì = Normalize(Ë)
+                Vector3D velocityError = targetVelocity - currentVelocity; // Í = z - w
+                                                                           // Derivative error component perpendicular to target direction
+                Vector3D derivativeErrorComponent = derivativeTerm - Vector3D.Dot(derivativeTerm, directionToTarget) * directionToTarget; // Î = ª - Dot(ª, Ì) * Ì
+
+                Vector3D correctionVector = CalculateCorrectionVector(positionError, directionToTarget, velocityError, derivativeErrorComponent); // Ð = Ï(...)
+
+                double maxAccelSq = maxAcceleration * maxAcceleration; // Ñ = x * x
+                                                                       // Limit correction magnitude, prioritize movement towards target
+                double limitedCorrectionMagSq = maxAccelSq - Math.Min(maxAccelSq, correctionVector.LengthSquared()); // Ò = Ñ - Min(Ñ, Ð.LengthSquared())
+
+                return correctionVector + Math.Sqrt(limitedCorrectionMagSq) * directionToTarget; // Ð + Sqrt(Ò) * Ì
             }
-
-            protected abstract Vector3D GetLatax(
-                Vector3D missileToTarget,
-                Vector3D missileToTargetNorm,
-                Vector3D relativeVelocity,
-                Vector3D lateralTargetAcceleration);
-
-            public override Vector3D GetPointingVector(
-    Vector3D missilePosition,
-    Vector3D missileVelocity,
-    double missileAcceleration,
-    Vector3D targetPosition,
-    Vector3D targetVelocity,
-    Vector3D targetAcceleration,
-    Vector3D gravity)            // ⬅︎ matches new base signature
-            {
-                /* ---------- the usual PN bits ---------- */
-                Vector3D m2t = targetPosition - missilePosition;
-                Vector3D m2tNorm = Vector3D.Normalize(m2t);
-                Vector3D relVel = targetVelocity - missileVelocity;
-                Vector3D latTgtAcc = targetAcceleration
-                                   - Vector3D.Dot(targetAcceleration, m2tNorm) * m2tNorm;
-
-                Vector3D latax = GetLatax(m2t, m2tNorm, relVel, latTgtAcc);
-
-                /* ---------- keep everything inside the missile’s thrust budget ---------- */
-                double aMax2 = missileAcceleration * missileAcceleration;
-                double lat2 = latax.LengthSquared();
-                if (lat2 > aMax2)                   // lateral demand too high – scale it back
-                    latax *= missileAcceleration / Math.Sqrt(lat2);
-
-                double axialMag = Math.Sqrt(aMax2 - latax.LengthSquared());
-                Vector3D axial = axialMag * m2tNorm;
-
-                /* ---------- include gravity *inside* the same budget ---------- */
-                Vector3D cmdAccel = latax + axial - gravity;
-                return cmdAccel;                    // magnitude ≤ aMax, gravity compensated
-            }
-
+            protected abstract Vector3D CalculateCorrectionVector(Vector3D positionError, Vector3D directionToTarget, Vector3D velocityError, Vector3D derivativeErrorComponent); // Ï(Ë, Ì, Í, Î)
 
         }
         class ProNavGuidance : RelNavGuidance
         {
             // State for smoothing relative velocity
             private Vector3D _previousSmoothedRelativeVelocity = Vector3D.Zero;
-            private bool _hasSmoothedOnce = false; // Flag to handle first calculation
-
-            // Smoothing factor (from Script B, value was 0.8)
-            private const double SMOOTHING_FACTOR = 0.8;
-            // Override ClearTargetAccelerationData to also clear smoothing history
-            public new void ClearTargetAccelerationData()
+            private readonly IMyRemoteControl _remoteControl; // O
+            private double proportionalGain; // Æ
+            private double derivativeGain; // Ç
+            public ProNavGuidance(double timeConstant, double proportionalGain, IMyRemoteControl remote, double derivativeGain = 0) : base(timeConstant, proportionalGain, derivativeGain) // F(o, È, Ó, É=0)
             {
-                base.ClearTargetAccelerationData(); // Call base method
-                _previousSmoothedRelativeVelocity = Vector3D.Zero;
-                _hasSmoothedOnce = false;
+                _remoteControl = remote;
+                this.proportionalGain = proportionalGain; // Æ
             }
-            public ProNavGuidance(double updatesPerSecond, double navConstant, double navAccelConstant = 0)
-                : base(updatesPerSecond, navConstant, navAccelConstant)
-            { }
 
-
-
-            // Implementation of lateral acceleration command using Script B's logic
-            protected override Vector3D GetLatax(
-                Vector3D missileToTarget,        // Vector from missile to target (Ë in Script B)
-                Vector3D missileToTargetNorm,    // Normalized LOS vector (Ì in Script B)
-                Vector3D relativeVelocity,       // Raw relative velocity (Í in Script B)
-                Vector3D lateralTargetAcceleration // Lateral component of target accel (Î in Script B)
-                )
+            protected override Vector3D CalculateCorrectionVector(Vector3D positionError, Vector3D directionToTarget, Vector3D velocityError, Vector3D derivativeErrorComponent) // Ï(Ë, Ì, Í, Î)
             {
-                // 1. Smooth the relative velocity (Ö = Õ * Í + (1 - Õ) * Ô)
-                Vector3D smoothedRelativeVelocity;
-                if (!_hasSmoothedOnce)
-                {
-                    smoothedRelativeVelocity = relativeVelocity; // Use raw value first time
-                    _hasSmoothedOnce = true;
-                }
-                else
-                {
-                    smoothedRelativeVelocity = SMOOTHING_FACTOR * relativeVelocity + (1.0 - SMOOTHING_FACTOR) * _previousSmoothedRelativeVelocity;
-                }
-                _previousSmoothedRelativeVelocity = smoothedRelativeVelocity; // Store for next iteration (Ô=Ö)
+                Vector3D gravity = _remoteControl.GetNaturalGravity(); // µ
+                double smoothingFactor = 0.8; // Õ
+                                              // Smooth the velocity error over time (simple low-pass filter)
+                Vector3D currentSmoothedError = smoothingFactor * velocityError + (1 - smoothingFactor) * _previousSmoothedRelativeVelocity; // Ö = Õ*Í + (1-Õ)*Ô
+                _previousSmoothedRelativeVelocity = currentSmoothedError; // Ô = Ö
 
-                // 2. Calculate Line-of-Sight (LOS) rate (omega) using SMOOTHED velocity
-                // Ø = Vector3D.Cross(Ë, Ö) / Math.Max(Ë.LengthSquared(), 1)
-                Vector3D omega = Vector3D.Cross(missileToTarget, smoothedRelativeVelocity) /
-                                 Math.Max(missileToTarget.LengthSquared(), 1e-6); // Avoid div by zero
+                // Calculate a turning vector based on position error and smoothed velocity error
+                Vector3D turnAxis = Vector3D.Cross(positionError, currentSmoothedError) / Math.Max(positionError.LengthSquared(), 1); // Ø = Cross(Ë, Ö) / Max(Ë², 1)
 
-                // 3. Calculate ProNav command using SMOOTHED relative velocity MAGNITUDE
-                // PN_Command = Æ * Ö.Length() * Vector3D.Cross(Ø, Ì)
-                // Note: Script B used Ö.Length(), Script A used closing velocity. We use Ö.Length() here.
-                double smoothedRelVelMag = smoothedRelativeVelocity.Length();
-                Vector3D pnCommand = NavConstant * smoothedRelVelMag * Vector3D.Cross(omega, missileToTargetNorm);
+                // Proportional term: Turn towards the target based on smoothed velocity error magnitude and turn axis
+                Vector3D proportionalTerm = proportionalGain * currentSmoothedError.Length() * Vector3D.Cross(turnAxis, directionToTarget);
+                // Derivative term: Directly use the perpendicular component of the derivative input
+                Vector3D derivativeTerm = derivativeGain * derivativeErrorComponent;
+                // Gravity compensation is handled in the base class, subtract it here as part of correction
+                Vector3D gravityCompensation = -gravity;
 
-                // 4. Add Augmented ProNav term (prediction based on target acceleration)
-                // APN_Command = Ç * Î
-                // Note: Script B didn't apply the 0.5 factor common in APN. We follow Script B here.
-                Vector3D apnCommand = NavAccelConstant * lateralTargetAcceleration;
-
-                // 5. Return the combined lateral command.
-                // *** Gravity is NOT handled here - it's handled correctly in RelNavGuidance.GetPointingVector ***
-                return pnCommand + apnCommand;
-            }
-        }
-
-
-        class BombDragProNavGuidance : ProNavGuidance
-        {
-            // How often to log (in calls to GetPointingVector).
-            private readonly IMyRemoteControl _remoteControl;
-            // Simple counter to know when it's time to log.
-            public int _tickCounter;
-            public Vector3D previousForward;
-            private bool _initialVelocityLogged = false;
-            // A buffer that accumulates the log lines in memory.
-            private readonly List<string> _logEntries = new List<string>();
-
-            // Publicly accessible property to retrieve the log from outside the class.
-            public IReadOnlyList<string> LogEntries => _logEntries.AsReadOnly();
-
-            public BombDragProNavGuidance(
-                double updatesPerSecond,
-                double navConstant,
-                IMyRemoteControl remoteControl,
-                double navAccelConstant = 0
-            )
-                : base(updatesPerSecond, navConstant, navAccelConstant)
-            {
-                _remoteControl = remoteControl;
-                _tickCounter = 0;
-            }
-            double CalculateAngleBetween(Vector3D v1, Vector3D v2)
-            {
-                double dot = Vector3D.Dot(v1, v2);
-                double magProduct = v1.Length() * v2.Length();
-
-                if (magProduct < 1e-6) return 0; // Avoid division by zero
-
-                double cosTheta = MathHelper.Clamp(dot / magProduct, -1.0, 1.0); // Clamp to avoid NaN issues
-                return Math.Acos(cosTheta) * (180.0 / Math.PI); // Convert to degrees
-            }
-            /// <summary>
-            /// Overridden so that we only return lateral drag guidance,
-            /// not forward thrust or direct gravity compensation.
-            /// </summary>
-            public override Vector3D GetPointingVector(
-    Vector3D missilePosition,
-    Vector3D missileVelocity,
-    double missileAcceleration,
-    Vector3D targetPosition,
-    Vector3D targetVelocity,
-    Vector3D targetAcceleration, Vector3D gravity2
-)
-            {
-                Vector3D missileToTarget = targetPosition - missilePosition;
-                if (missileToTarget.LengthSquared() < 1e-6)
-                    return Vector3D.Zero;
-
-                Vector3D losDir = Vector3D.Normalize(missileToTarget);
-                Vector3D relativeVelocity = targetVelocity - missileVelocity;
-
-                // Recompute target acceleration if you like
-                Vector3D targetAccel = Vector3D.Zero;
-                if (_lastVelocity.HasValue)
-                    targetAccel = (targetVelocity - _lastVelocity.Value) * UpdatesPerSecond;
-                _lastVelocity = targetVelocity;
-
-                // Lateral portion of that acceleration
-                Vector3D lateralTargetAccel
-                    = targetAccel - Vector3D.Dot(targetAccel, losDir) * losDir;
-
-                // Our standard lateral PN
-                Vector3D lateralAcceleration = GetLatax(
-                    missileToTarget,
-                    losDir,
-                    relativeVelocity,
-                    lateralTargetAccel
-                );
-
-                // ---------------------------
-                // Example of explicit gravity compensation for a bomb
-                // If you want partial, multiply by e.g. 0.5 or so
-                // If you want "pure ballistic," skip it entirely.
-                // NOTE:  _remoteControl.GetNaturalGravity() is downward,
-                // so subtracting it = adding an upward acceleration
-                // to try to counter gravity
-                // ---------------------------
-                Vector3D gravity = _remoteControl.GetNaturalGravity(); // downward vector
-                Vector3D gravityComp = -gravity; // upward
-
-                // Combine them:
-                Vector3D totalAcceleration = lateralAcceleration + gravityComp;
-
-                // --- Logging System ---
-                if (!_initialVelocityLogged)
-                {
-                    _initialVelocityLogged = true;
-                    double initSpeed = missileVelocity.Length();
-                    _logEntries.Add(
-                        $"[Tick={_tickCounter}] InitialVelocity={initSpeed:F2} m/s " +
-                        $"Vector=({missileVelocity.X:F2}, {missileVelocity.Y:F2}, {missileVelocity.Z:F2})"
-                    );
-                }
-
-                // Log key values every 60 ticks
-                if (_tickCounter % 60 == 0)
-                {
-                    double dist = missileToTarget.Length();
-                    double latAccelMag = lateralAcceleration.Length();
-                    double totalAccelMag = totalAcceleration.Length();
-                    double missileSpeed = missileVelocity.Length();
-                    double gravMag = gravity.Length();
-                    double timeElapsed = _tickCounter / UpdatesPerSecond; // Convert to seconds
-                    // Compute current steer angle (angle between forward direction & target)
-                    double steerAngle = Math.Acos(Vector3D.Dot(_remoteControl.WorldMatrix.Forward, Vector3D.Normalize(missileToTarget))) * (180.0 / Math.PI);
-
-                    // Compute steer strength effectiveness (change in orientation per tick)
-                    double steerEffectiveness = CalculateAngleBetween(previousForward, _remoteControl.WorldMatrix.Forward) * (180.0 / Math.PI);
-
-                    _logEntries.Add(
-                        $"[Tick={_tickCounter}]" +
-                        $"Dist={dist:F2}m  BSpd={missileSpeed:F2}m/s  " +
-                        $"LatAccel={latAccelMag:F2}m/s²  TtlAccl={totalAccelMag:F2}m/s²  " +
-                        $"GMag={gravMag:F2}m/s²  " +
-                        $"BPos=({missilePosition.X:F2}, {missilePosition.Y:F2}, {missilePosition.Z:F2})  " +
-                        $"RlVel=({relativeVelocity.X:F2}, {relativeVelocity.Y:F2}, {relativeVelocity.Z:F2})  " +
-                        $"SteerAngle={steerAngle:F2}°  SteerEffect={steerEffectiveness:F2}°/tick"
-                    );
-
-                    // Update previous forward direction for next tick comparison
-                    previousForward = _remoteControl.WorldMatrix.Forward;
-                }
-
-                _tickCounter++;
-                
-                return totalAcceleration;
+                return proportionalTerm + derivativeTerm + gravityCompensation; // Æ*Ö.Length()*Cross(Ø, Ì) + Ç*Î - µ
             }
 
 
         }
+
 
 
 
@@ -633,8 +414,7 @@ namespace IngameScript
                         //soundblock = GridTerminalSystem.GetBlockWithName("pain") as IMySoundBlock;
                         //soundblock.SelectedSound = "Christ";
                         //soundblock.Play();
-                        _proNavGuidance = new ProNavGuidance(updatesPerSecond, _navConstant);
-                        _bombDragProNavGuidance = new BombDragProNavGuidance(updatesPerSecond, _navConstant, _remoteControl);
+                        _proNavGuidance = new ProNavGuidance(updatesPerSecond, _navConstant, _remoteControl);
                         startingDistance = Vector3D.Distance(_remoteControl.GetPosition(), _waypoints[_waypoints.Count - 1]);
                         string targetName = "Sci-Fi";
                         GridTerminalSystem.GetBlocksOfType(_thrusters);
@@ -794,120 +574,143 @@ namespace IngameScript
                 double missileAcceleration;
                 Vector3D naturalgravity = _remoteControl.GetNaturalGravity();
                 Vector3D desiredAcceleration;
-                if (armtype == "bomb")
+                     desiredAcceleration = _proNavGuidance.CalculateDesiredAcceleration(
+                             _remoteControl.GetPosition(), // v: O.GetPosition()
+                             currentVelocity,              // w: ì
+                             CalculateMissileAcceleration(),        // x: x
+                             _destination,         // y: ï
+                             Vector3D.Zero,                 // z: Vector3D.Zero (Assuming target is stationary)
+                             naturalgravity                   // µ: ô
+                        );
+
+
+
+
+                
+
+                Vector3D toTarget = _destination - currentPos;
+                Vector3D toTargetDirection = Vector3D.Normalize(toTarget);
+
+                double alignment = Vector3D.Dot(_remoteControl.WorldMatrix.Forward, toTargetDirection);
+
+                double speedTowardsTarget = Vector3D.Dot(currentVelocity, toTargetDirection);
+                // Check alignment with target direction
+                double forwardAlignmentFactor = Vector3D.Dot(_remoteControl.WorldMatrix.Forward, toTargetDirection); // ý = Dot(O.WorldMatrix.Forward, ü)
+                                                                                                                              // Check closing speed towards target
+                double closingSpeed = Vector3D.Dot(currentVelocity, toTargetDirection); // þ = Dot(ì, ü)
+
+                // --- Constants ---
+                const double ALIGNMENT_THRESHOLD = 0.8;          // ÿ - General alignment threshold (Cosine value)
+                const double VERY_HIGH_ALIGNMENT_THRESHOLD = 0.9; // Corresponds to ~1.8 degrees off. Use 0.99996 for ~0.5 degrees.
+                                                                     // This is the threshold ABOVE which speed limit boost starts.
+
+                const float BASE_MAX_SPEED = 350.0f;              // Default maximum speed limit when alignment is good but not "very high"
+                const float BOOST_MAX_SPEED = 450.0f;             // The maximum speed limit achievable with perfect alignment (1.0)
+                const float MIN_SPEED_FOR_THRUST_INCREASE = 290.0f; // ā - Speed below which thrust increases
+                const float LOWER_SPEED_THRUST_RAMP = 245.0f;      // Speed below which thrust starts ramping up from zero
+
+// Get the current velocity direction (handle zero velocity)
+Vector3D velocityDirection = Vector3D.Zero;
+                double currentSpeed = currentVelocity.Length(); // Get the actual speed magnitude
+                if (currentSpeed > 0.01) // Use a small threshold to avoid issues with very low speeds
                 {
-                    // Calculate missile acceleration
-                    missileAcceleration = 0;
-                    // Update the guidance
-                    var logEntries = _bombDragProNavGuidance.LogEntries;
-                    int maxDisplay = Math.Min(40, logEntries.Count);
-                    string base64Encoded = "";
-                    for (int i = 0; i < maxDisplay; i++)
-                    {
-                        base64Encoded += logEntries[i];
-                        
-                    }
-                    
-                    desiredAcceleration = _bombDragProNavGuidance.Update(
-                        missilePosition: _remoteControl.GetPosition(),
-                        missileVelocity: currentVelocity,
-                        missileAcceleration: missileAcceleration,
-                        targetPosition: _destination,
-                        targetVelocity: Vector3D.Zero, // Use actual target velocity if available
-                        targetAcceleration: Vector3D.Zero,
-                        naturalGravity: naturalgravity// Use actual target acceleration if available
-                    );
+                    velocityDirection = Vector3D.Normalize(currentVelocity); // Normalize to get direction only
                 }
-                else
+                // else velocityDirection remains Zero - ship isn't moving significantly
+
+                // Check alignment between VELOCITY direction and target direction
+                // Rename 'forwardAlignmentFactor' to 'velocityAlignmentFactor' for clarity
+                double velocityAlignmentFactor = 0; // Default to 0 if not moving
+                if (currentSpeed > 0.01)
                 {
-                    // Calculate missile acceleration
-                    missileAcceleration = CalculateMissileAcceleration();
-                    // Update the guidance
-                    distanceToTarget = Vector3D.Distance(currentPos, _destination);
-                    Vector3D targetVelocityToUse = Vector3D.Zero;
-                    Vector3D targetAccelerationToUse = Vector3D.Zero;
-                    Vector3D targetPositionToUse = _destination; // Default to the fixed destination
+                    velocityAlignmentFactor = Vector3D.Dot(currentVelocity, toTargetDirection); // ý (new definition) = Dot(Normalized(ì), ü)
+                }
 
-                    // Check if you have a valid detected entity
-                    if (detectedEntity.Velocity != null /* && detectedEntity.IsAlive or similar check */)
+                // --- Input Variables (Assumed to be available) ---
+                // double forwardAlignmentFactor; // ý - Current alignment factor (e.g., Dot product result, 1.0 is perfect)
+                // double closingSpeed;         // þ - Current speed towards waypoint
+                // int waypointsCount;          // L.Count - Number of waypoints remaining
+
+                // --- Logic ---
+                float thrustOverride = 1.0f; // n - Default to full thrust unless adjusted
+                float currentMaxSpeed = BASE_MAX_SPEED; // Start with the base speed limit
+
+                if (velocityAlignmentFactor > ALIGNMENT_THRESHOLD) // if(ý > ÿ) - Are we generally aligned?
+                {
+                    // --- Calculate Dynamic Speed Limit Based on Alignment Quality ---
+                    if (velocityAlignmentFactor >= VERY_HIGH_ALIGNMENT_THRESHOLD)
                     {
-                        // Use the detected entity's current velocity
-                        targetVelocityToUse = detectedEntity.Velocity;
-                        targetPositionToUse = detectedEntity.Position; // Use live position if available
-
-                        // Calculate acceleration if we have velocity from the previous tick
-                        if (_hasPreviousTargetVelocity)
+                        // Alignment is very high. Interpolate max speed between BASE_MAX_SPEED (at the threshold)
+                        // and BOOST_MAX_SPEED (at perfect 1.0 alignment).
+                        const float perfectAlignment = 1.0f;
+                        float highAlignRange = perfectAlignment - (float)VERY_HIGH_ALIGNMENT_THRESHOLD;
+                        // Avoid division by zero if threshold is exactly 1.0
+                        if (highAlignRange > 0.00001f)
                         {
-                            Vector3D deltaVelocity = targetVelocityToUse - _previousTargetVelocity;
-                            targetAccelerationToUse = deltaVelocity / 1.0f / 60.0f;
+                            float currentHighPos = (float)velocityAlignmentFactor - (float)VERY_HIGH_ALIGNMENT_THRESHOLD;
+                            float boostFactor = MathHelper.Clamp(currentHighPos / highAlignRange, 0f, 1f); // 0 at threshold, 1 at perfect
+                            currentMaxSpeed = BASE_MAX_SPEED + (BOOST_MAX_SPEED - BASE_MAX_SPEED) * boostFactor;
                         }
-                        // Else: This is the first frame we see this target, or we lost track
-                        // previously. Acceleration remains zero for this frame.
-
-                        // Store current velocity for the *next* frame's calculation
-                        _previousTargetVelocity = targetVelocityToUse;
-                        _hasPreviousTargetVelocity = true;
+                        else
+                        {
+                            // If threshold is effectively 1.0, only grant boost speed at perfect alignment
+                            currentMaxSpeed = (velocityAlignmentFactor >= perfectAlignment) ? BOOST_MAX_SPEED : BASE_MAX_SPEED;
+                        }
                     }
                     else
                     {
-                        // No valid detected entity, use Zero vectors and reset tracking
-                        targetVelocityToUse = Vector3D.Zero;
-                        targetAccelerationToUse = Vector3D.Zero;
-                        targetPositionToUse = _destination; // Revert to fixed destination if target lost
-                        _previousTargetVelocity = Vector3D.Zero; // Reset stored velocity
-                        _hasPreviousTargetVelocity = false;      // Reset flag
+                        // Alignment is good, but not "very high" (between ALIGNMENT_THRESHOLD and VERY_HIGH_ALIGNMENT_THRESHOLD)
+                        // Optionally, you could slightly reduce the max speed here as alignment degrades from VERY_HIGH down to ALIGNMENT.
+                        // For simplicity here, we'll just keep it at BASE_MAX_SPEED in this range.
+                        // If you wanted to penalize slightly decreasing alignment:
+                        // float alignRange = (float)(VERY_HIGH_ALIGNMENT_THRESHOLD - ALIGNMENT_THRESHOLD);
+                        // float currentPosInRange = (float)(forwardAlignmentFactor - ALIGNMENT_THRESHOLD);
+                        // float interpFactor = MathHelper.Clamp(currentPosInRange / alignRange, 0f, 1f); // 0 at ALIGNMENT_THRESHOLD, 1 at VERY_HIGH
+                        // currentMaxSpeed = SOME_LOWER_MAX_SPEED + (BASE_MAX_SPEED - SOME_LOWER_MAX_SPEED) * interpFactor;
+                        currentMaxSpeed = BASE_MAX_SPEED; // Keep it simple: Use base speed unless alignment is very high.
                     }
 
-                    // --- Call the Guidance Update ---
-                    desiredAcceleration = _proNavGuidance.Update(
-                        missilePosition: currentPos,
-                        missileVelocity: currentVelocity,
-                        missileAcceleration: CalculateMissileAcceleration(), // Your existing function
-                        targetPosition: targetPositionToUse,             // Use determined position
-                        targetVelocity: targetVelocityToUse,             // Use determined velocity
-                        targetAcceleration: targetAccelerationToUse,      // Use calculated acceleration
-                        naturalGravity: _remoteControl.GetNaturalGravity()
-                    );
+                    // Ensure the calculated max speed doesn't go below the speed-up threshold
+                    currentMaxSpeed = Math.Max(currentMaxSpeed, MIN_SPEED_FOR_THRUST_INCREASE);
 
+                    // --- Thrust Control based on Dynamic Speed Limit ---
+                    if (closingSpeed > currentMaxSpeed && _waypoints.Count > 1) // Only check speed limit if intermediate waypoints exist? (L.Count > 1)
+                    {
+                        // Exceeding current dynamic speed limit (and not final waypoint) -> Cut thrust
+                        thrustOverride = 0.0f; // n = 0.0f
+                    }
+                    else if (closingSpeed < MIN_SPEED_FOR_THRUST_INCREASE)
+                    {
+                        // Too slow -> Increase thrust (using interpolation)
+                        float upperSpeed = MIN_SPEED_FOR_THRUST_INCREASE; // Ā (Target speed for full thrust in this regime)
+                        float lowerSpeed = LOWER_SPEED_THRUST_RAMP;      // ā (Speed below which thrust starts increasing)
 
-
+                        // Linear interpolation for thrust between lowerSpeed and upperSpeed
+                        // Avoid division by zero if upperSpeed == lowerSpeed
+                        if (upperSpeed > lowerSpeed)
+                        {
+                            float thrustFactor = (upperSpeed - (float)closingSpeed) / (upperSpeed - lowerSpeed); // Ă = (Ā - þ) / (Ā - ā)
+                            thrustOverride = MathHelper.Clamp(thrustFactor, 0f, 1f); // n = 1f * Ă (Clamp ensures 0 to 1)
+                        }
+                        else
+                        {
+                            // If speeds are the same, just use binary logic
+                            thrustOverride = (closingSpeed < lowerSpeed) ? 1.0f : 0.0f;
+                        }
+                    }
+                    else
+                    {
+                        // Speed is within acceptable range (MIN_SPEED_FOR_THRUST_INCREASE to currentMaxSpeed)
+                        // Maintain full thrust (or whatever the default behavior should be)
+                        thrustOverride = 1.0f; // n = 1.0f (Assuming default is full thrust when speed is okay)
+                    }
                 }
-                // —— new thrust logic — use the full accel magnitude from guidance ——
-                // aMax: maximum possible accel (F_total / mass)
-                double aMax = CalculateMissileAcceleration();
-                // thrustMag: how much accel we actually need (gravity + steering)
-                double thrustMag = desiredAcceleration.Length();
-                // thrustDir: keep the normalized direction for your gyros
-                Vector3D thrustDir = VectorMath.SafeNormalize(desiredAcceleration);
-
-                // % override = needed accel ÷ available accel (cap at 100%)
-                // Compute steering angle
-                double steeringAngleRad = Math.Acos(MathHelper.Clamp(Vector3D.Dot(VectorMath.SafeNormalize(currentVelocity), VectorMath.SafeNormalize(desiredAcceleration)), -1, 1));
-                double steeringAngleDeg = steeringAngleRad * (180.0 / Math.PI);
-
-                // Aggressively lower thrust if steering sharply
-                float steeringThrustFactor = steeringAngleDeg > 15.0 ? 0.2f : 1.0f;
-
-                thrustOverride = (float)(steeringThrustFactor * Math.Min(1.0, thrustMag / aMax));
-                // —— after computing thrustOverride, thrustMag, thrustDir ——
-                double currentSpeed = currentVelocity.Length();
-                const double MAX_SPEED = 150.0;
-                // how much of our velocity is in the thrust direction?
-                double speedAlongDesired = Vector3D.Dot(currentVelocity, thrustDir);
-
-                // if we’re already too fast AND we’d be thrusting to go even faster along our current path, cut it
-                if (currentSpeed > MAX_SPEED && speedAlongDesired > MAX_SPEED)
+                else // Not aligned well (forwardAlignmentFactor <= ALIGNMENT_THRESHOLD)
                 {
-                    thrustOverride = 0f;
-                }  
-
-                double missileMaxAcceleration = CalculateMissileAcceleration();
-                double realisticAccelerationLimit = missileMaxAcceleration * 0.74; // safety margin (90%)
-
-                // Clamp desired acceleration:
-                if (desiredAcceleration.Length() > realisticAccelerationLimit)
-                {
-                    desiredAcceleration = Vector3D.Normalize(desiredAcceleration) * realisticAccelerationLimit;
+                    // Cut forward thrust to allow turning
+                    thrustOverride = 0.0f; // n = 0.0f
+                                           // The currentMaxSpeed naturally remains at BASE_MAX_SPEED or lower from the initial value or previous frame's state.
+                                           // No need to explicitly reset it here unless using stateful logic.
                 }
 
                 _remoteControl.DampenersOverride = false;
@@ -922,12 +725,6 @@ namespace IngameScript
 
 
 
-                Vector3D toTarget = _destination - currentPos;
-                Vector3D toTargetDirection = Vector3D.Normalize(toTarget);
-
-                double alignment = Vector3D.Dot(_remoteControl.WorldMatrix.Forward, toTargetDirection);
-
-                double speedTowardsTarget = Vector3D.Dot(currentVelocity, toTargetDirection);
 
                 if (lcdMain != null)
                 {
@@ -935,6 +732,10 @@ namespace IngameScript
                 }
             }
         }
+
+
+
+
         double CalculateMissileAcceleration()
         {
             // Sum up the maximum effective thrust of your main thrusters
@@ -965,16 +766,16 @@ namespace IngameScript
             Vector3D rotationAxis = Vector3D.Cross(currentDirection, desiredDirection);
             double angle = Math.Acos(MathHelper.Clamp(Vector3D.Dot(currentDirection, desiredDirection), -1, 1));
 
-            if (angle < 0.001)
-                return Vector3D.Zero;
+            if (Math.Abs(angle) < 1e-6) return Vector3D.Zero;
+
 
             rotationAxis = Vector3D.Normalize(rotationAxis);
 
             // Dynamically scaled rotation speed
-            double baseRotationSpeed = MathHelper.Clamp(50.0 / currentSpeed, 5.0, 30.0); // lower at high speeds
-            double rotationSpeed = angle * baseRotationSpeed;
+            double rotationSpeed = angle * 60;
 
             return rotationAxis * rotationSpeed;
+
         }
 
 
@@ -1159,20 +960,23 @@ namespace IngameScript
             return Math.Acos(dotProduct);
         }
 
-        void ApplyGyroOverride(Vector3D rotationVector, List<IMyGyro> gyros, MatrixD worldMatrix)
+        void ApplyGyroOverride(Vector3D worldAngularVelocity, List<IMyGyro> gyros, MatrixD shipWorldMatrix) // ù(ø, ĥ, Ć)
         {
-            const double gyroStrengthMultiplier = 1;  // Smooth adjustments
-
-            foreach (var gyro in gyros)
+            foreach (var gyro in gyros) // foreach(var Ħ in ĥ)
             {
-                var localRotationVec = Vector3D.TransformNormal(rotationVector, MatrixD.Transpose(gyro.WorldMatrix));
+                // Transform world angular velocity to gyro's local frame
+                var localAngularVelocity = Vector3D.TransformNormal(worldAngularVelocity, MatrixD.Transpose(gyro.WorldMatrix)); // ħ = TransformNormal(ø, Transpose(Ħ.WorldMatrix))
 
-                gyro.Pitch = (float)(-localRotationVec.X * gyroStrengthMultiplier);
-                gyro.Yaw = (float)(-localRotationVec.Y * gyroStrengthMultiplier);
-                gyro.Roll = (float)(-localRotationVec.Z * gyroStrengthMultiplier);
+                // Apply to pitch, yaw, roll (might need sign adjustments depending on gyro orientation)
+                float pitch = (float)(-localAngularVelocity.X); // Ĩ = (float)(-ħ.X)
+                float yaw = (float)(-localAngularVelocity.Y);   // ĩ = (float)(-ħ.Y)
+                float roll = (float)(-localAngularVelocity.Z);  // Ī = (float)(-ħ.Z)
 
-                gyro.GyroOverride = true;
-                gyro.Enabled = true;
+                gyro.Enabled = true; // Ħ.Enabled = true
+                gyro.Pitch = pitch; // Ħ.Pitch = Ĩ
+                gyro.Yaw = yaw;     // Ħ.Yaw = ĩ
+                gyro.Roll = roll;   // Ħ.Roll = Ī
+                gyro.GyroOverride = true; // Ħ.GyroOverride = true
             }
         }
 
