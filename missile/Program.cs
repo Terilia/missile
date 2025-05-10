@@ -631,88 +631,33 @@ Vector3D velocityDirection = Vector3D.Zero;
                 // double closingSpeed;         // þ - Current speed towards waypoint
                 // int waypointsCount;          // L.Count - Number of waypoints remaining
 
+                // --- Define Constants ---
+               const float REQUIRED_MIN_CLOSING_SPEED = 100.0f; // *** NEW: Minimum required speed towards target when aligned ***
+
+                // --- Assume these are calculated elsewhere ---
+                // double velocityAlignmentFactor: Dot product between ship's forward vector and velocity vector (normalized).
+                //                                Ranges from -1 (moving backward) to 1 (moving forward).
+                // double closingSpeed: The component of the ship's velocity directly towards the target waypoint/enemy (in m/s).
+                //                      Positive means moving towards, negative means moving away.
+                // List<Waypoint> _waypoints: A list representing the path or targets.
+                // MathHelper.Clamp: A function Clamp(value, min, max).
+                // Math.Max: A function Max(val1, val2).
+
+                // Example values for testing:
+                int waypointCount = 2;             // Assume _waypoints.Count = 2
+
                 // --- Logic ---
                 float thrustOverride = 1.0f; // n - Default to full thrust unless adjusted
                 float currentMaxSpeed = BASE_MAX_SPEED; // Start with the base speed limit
 
-                if (velocityAlignmentFactor > ALIGNMENT_THRESHOLD) // if(ý > ÿ) - Are we generally aligned?
+               if(currentVelocity.Length() > 180)
                 {
-                    // --- Calculate Dynamic Speed Limit Based on Alignment Quality ---
-                    if (velocityAlignmentFactor >= VERY_HIGH_ALIGNMENT_THRESHOLD)
-                    {
-                        // Alignment is very high. Interpolate max speed between BASE_MAX_SPEED (at the threshold)
-                        // and BOOST_MAX_SPEED (at perfect 1.0 alignment).
-                        const float perfectAlignment = 1.0f;
-                        float highAlignRange = perfectAlignment - (float)VERY_HIGH_ALIGNMENT_THRESHOLD;
-                        // Avoid division by zero if threshold is exactly 1.0
-                        if (highAlignRange > 0.00001f)
-                        {
-                            float currentHighPos = (float)velocityAlignmentFactor - (float)VERY_HIGH_ALIGNMENT_THRESHOLD;
-                            float boostFactor = MathHelper.Clamp(currentHighPos / highAlignRange, 0f, 1f); // 0 at threshold, 1 at perfect
-                            currentMaxSpeed = BASE_MAX_SPEED + (BOOST_MAX_SPEED - BASE_MAX_SPEED) * boostFactor;
-                        }
-                        else
-                        {
-                            // If threshold is effectively 1.0, only grant boost speed at perfect alignment
-                            currentMaxSpeed = (velocityAlignmentFactor >= perfectAlignment) ? BOOST_MAX_SPEED : BASE_MAX_SPEED;
-                        }
-                    }
-                    else
-                    {
-                        // Alignment is good, but not "very high" (between ALIGNMENT_THRESHOLD and VERY_HIGH_ALIGNMENT_THRESHOLD)
-                        // Optionally, you could slightly reduce the max speed here as alignment degrades from VERY_HIGH down to ALIGNMENT.
-                        // For simplicity here, we'll just keep it at BASE_MAX_SPEED in this range.
-                        // If you wanted to penalize slightly decreasing alignment:
-                        // float alignRange = (float)(VERY_HIGH_ALIGNMENT_THRESHOLD - ALIGNMENT_THRESHOLD);
-                        // float currentPosInRange = (float)(forwardAlignmentFactor - ALIGNMENT_THRESHOLD);
-                        // float interpFactor = MathHelper.Clamp(currentPosInRange / alignRange, 0f, 1f); // 0 at ALIGNMENT_THRESHOLD, 1 at VERY_HIGH
-                        // currentMaxSpeed = SOME_LOWER_MAX_SPEED + (BASE_MAX_SPEED - SOME_LOWER_MAX_SPEED) * interpFactor;
-                        currentMaxSpeed = BASE_MAX_SPEED; // Keep it simple: Use base speed unless alignment is very high.
-                    }
-
-                    // Ensure the calculated max speed doesn't go below the speed-up threshold
-                    currentMaxSpeed = Math.Max(currentMaxSpeed, MIN_SPEED_FOR_THRUST_INCREASE);
-
-                    // --- Thrust Control based on Dynamic Speed Limit ---
-                    if (closingSpeed > currentMaxSpeed && _waypoints.Count > 1) // Only check speed limit if intermediate waypoints exist? (L.Count > 1)
-                    {
-                        // Exceeding current dynamic speed limit (and not final waypoint) -> Cut thrust
-                        thrustOverride = 0.0f; // n = 0.0f
-                    }
-                    else if (closingSpeed < MIN_SPEED_FOR_THRUST_INCREASE)
-                    {
-                        // Too slow -> Increase thrust (using interpolation)
-                        float upperSpeed = MIN_SPEED_FOR_THRUST_INCREASE; // Ā (Target speed for full thrust in this regime)
-                        float lowerSpeed = LOWER_SPEED_THRUST_RAMP;      // ā (Speed below which thrust starts increasing)
-
-                        // Linear interpolation for thrust between lowerSpeed and upperSpeed
-                        // Avoid division by zero if upperSpeed == lowerSpeed
-                        if (upperSpeed > lowerSpeed)
-                        {
-                            float thrustFactor = (upperSpeed - (float)closingSpeed) / (upperSpeed - lowerSpeed); // Ă = (Ā - þ) / (Ā - ā)
-                            thrustOverride = MathHelper.Clamp(thrustFactor, 0f, 1f); // n = 1f * Ă (Clamp ensures 0 to 1)
-                        }
-                        else
-                        {
-                            // If speeds are the same, just use binary logic
-                            thrustOverride = (closingSpeed < lowerSpeed) ? 1.0f : 0.0f;
-                        }
-                    }
-                    else
-                    {
-                        // Speed is within acceptable range (MIN_SPEED_FOR_THRUST_INCREASE to currentMaxSpeed)
-                        // Maintain full thrust (or whatever the default behavior should be)
-                        thrustOverride = 1.0f; // n = 1.0f (Assuming default is full thrust when speed is okay)
-                    }
-                }
-                else // Not aligned well (forwardAlignmentFactor <= ALIGNMENT_THRESHOLD)
-                {
-                    // Cut forward thrust to allow turning
-                    thrustOverride = 0.0f; // n = 0.0f
-                                           // The currentMaxSpeed naturally remains at BASE_MAX_SPEED or lower from the initial value or previous frame's state.
-                                           // No need to explicitly reset it here unless using stateful logic.
+                    thrustOverride = 0.1f;
                 }
 
+                // --- Use the results ---
+                // Apply thrust based on 'thrustOverride'
+                // Maybe display 'currentMaxSpeed' or use it for other decisions.
                 _remoteControl.DampenersOverride = false;
                 foreach (var thruster in _thrusters)
                     thruster.ThrustOverridePercentage = thrustOverride;
