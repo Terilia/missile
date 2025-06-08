@@ -78,6 +78,8 @@ namespace IngameScript
         bool _isInitialized = false;
         bool _antiairmode = false;
         private Vector3D _previousTargetVelocity = Vector3D.Zero;
+        private Vector3D _previousTargetPoS = Vector3D.Zero;
+        Vector3D targetvelocity = Vector3D.Zero;
         private bool _hasPreviousTargetVelocity = false;
         int _ticks = 0;
         int _currentWaypointIndex = 0;
@@ -97,6 +99,88 @@ namespace IngameScript
         /// Simulates a bomb drop in Space Engineers with limited steering, gravity from a Remote Control,
         /// optional drag, and a maximum speed clamp.
         /// </summary>
+        /// 
+        public static Vector3D Normalize(Vector3D vector)
+        {
+            double mag = Magnitude(vector); // Using the helper Magnitude function
+
+            if (mag < 1e-9) // Or use a small epsilon for floating point comparison, e.g., mag < 1e-9
+            {
+                return new Vector3D(0, 0, 0); // Or Vector3D.Zero if your struct has it
+            }
+
+            return new Vector3D(vector.X / mag, vector.Y / mag, vector.Z / mag);
+        }
+        private static double Magnitude(Vector3D vector) 
+        {
+            return Math.Sqrt(MagnitudeSquared(vector));
+        }
+        public static double MagnitudeSquared(Vector3D vector)
+        {
+            return vector.X * vector.X + vector.Y * vector.Y + vector.Z * vector.Z;
+        }
+        public Vector3D UpdateAndGetVelocity(Vector3D currentPosition, Vector3D oldposition)
+        {
+            Vector3D velocity;
+            Vector3D displacement = currentPosition - oldposition;
+            velocity = displacement * 60;
+
+            return velocity;
+        }
+        public static Vector3D CalculateProportionalNavigation3D(
+        Vector3D interceptorPosition,
+        Vector3D interceptorVelocity,
+        Vector3D targetPosition,
+        Vector3D targetVelocity,
+        double navigationConstant)
+        {
+            Vector3D R_TM = targetPosition - interceptorPosition;
+            double R_TM_mag_sq = MagnitudeSquared(R_TM);
+            Vector3D R_TM_unit = Normalize(R_TM);
+            Vector3D V_rel = targetVelocity - interceptorVelocity;
+            double Vc = -Vector3D.Dot(V_rel, R_TM_unit);
+            Vector3D Omega = Vector3D.Cross(R_TM, V_rel) / R_TM_mag_sq;
+
+            Vector3D commandedAcceleration; // Declare here
+
+            if (Vc <= 1e-3)
+            {
+                // Fallback strategy
+                // For the fallback, also consider the acceleration limit.
+                // However, the example 120 is very high. Let's assume a desired max for fallback.
+                double maxFallbackAcceleration = 20.0; // Use the same limit or a specific one
+                commandedAcceleration = Normalize(R_TM) * maxFallbackAcceleration;
+            }
+            else
+            {
+                // Standard PN
+                commandedAcceleration = navigationConstant * Vc * Vector3D.Cross(Omega, R_TM_unit);
+            }
+
+            // --- Add Acceleration Limiting ---
+            double maxAcceleration = 20.0; // meters per second squared
+            double currentAccelerationMagnitude = Magnitude(commandedAcceleration); // Assuming you have a Magnitude function
+
+            if (currentAccelerationMagnitude > maxAcceleration)
+            {
+                commandedAcceleration = Normalize(commandedAcceleration) * maxAcceleration;
+            }
+            // --- End of Acceleration Limiting ---
+
+            // --- Conceptual: Applying Pitch/Yaw only if missile orientation is available ---
+            // If 'missileOrientation' (e.g., a quaternion or rotation matrix) is known:
+            // 1. Transform 'commandedAcceleration' to missile's body frame.
+            //    Vector3D accelBody = TransformToBodyFrame(commandedAcceleration, missileOrientation);
+            // 2. Zero out the roll component in the body frame (e.g., accelBody.x = 0 if x is roll axis).
+            //    accelBody.x = 0; // Or whichever axis is roll for your missile model
+            // 3. Transform back to world frame if needed by your physics engine/actuators.
+            //    commandedAcceleration = TransformToWorldFrame(accelBody, missileOrientation);
+            // Note: The exact implementation of TransformToBodyFrame and TransformToWorldFrame
+            // depends on your Vector3D and orientation representation (e.g., quaternions, matrices).
+            // --- End of Conceptual Pitch/Yaw ---
+
+            return commandedAcceleration;
+        }
         Vector3D SimulateBombDrop(
             Vector3D initialPosition,
             Vector3D initialVelocity,
@@ -220,6 +304,7 @@ namespace IngameScript
             
             // Other initialization code...
         }
+
 
         abstract class GuidanceBase
         {
@@ -400,13 +485,13 @@ namespace IngameScript
                 _ticks++;
 
 
-                if (_ticks < 100)
+                if (_ticks < 550)
                 {
 
                     if (_ticks < 10 && _ticks > 4)
                     {
                         _remoteControl = GridTerminalSystem.GetBlockWithName("Remote Control Missile") as IMyRemoteControl;
-                        if(armtype != "bomb")
+                        if (armtype != "bomb")
                         {
                             lcdMain = GridTerminalSystem.GetBlockWithName("Holo LCD") as IMyTextSurface;
                         }
@@ -456,6 +541,19 @@ namespace IngameScript
                         }
 
                     }
+                    if (_ticks > 15)
+                    {
+                        GridTerminalSystem.GetBlocksOfType(_gyros);
+                        Vector3D vector_to_target = targetPosition - _remoteControl.GetPosition();
+                        Vector3D forward_direction = Vector3D.Normalize(vector_to_target);
+                        Vector3D up_vector = -_remoteControl.GetTotalGravity();
+                        double uplift_strength = 0.6; // This is your tuning knob! Start around 0.5-1.0
+
+                        // Add the vectors
+                        Vector3D combined_direction = forward_direction + (up_vector * uplift_strength);
+                        ApplyGyroOverride(combined_direction, _gyros, _remoteControl.WorldMatrix, 0, 0);
+                    }
+                        
                     return;
                 }
 
@@ -529,7 +627,7 @@ namespace IngameScript
                     radar.TargetEnemies = true;
                     radar.TargetStations = true;
                     detectedEntity = radar.GetTargetedEntity();
-                    if (detectedEntity.IsEmpty() && distanceToTarget < 3500 && cooldown <= 0)
+                    if (detectedEntity.IsEmpty() && distanceToTarget < 9500 && cooldown <= 0 && distanceToTarget < startingDistance * 0.5)
                     {
                         radar.ShootOnce();
                         //radar.Enabled = false;
@@ -552,8 +650,9 @@ namespace IngameScript
                     if (!detectedEntity.IsEmpty())
                     {
                         _waypoints[_waypoints.Count - 1] = detectedEntity.Position;
+                        targetvelocity = detectedEntity.Velocity;
+                        targetPosition = detectedEntity.Position;
                     }
-                    Vector3D directionToLeadPoint = VectorMath.SafeNormalize(_destination - currentPos);
                 }
 
                 
@@ -571,109 +670,160 @@ namespace IngameScript
                     DetonateWarheads();
                     return;
                 }
-                double missileAcceleration;
-                Vector3D naturalgravity = _remoteControl.GetNaturalGravity();
-                Vector3D desiredAcceleration;
-                     desiredAcceleration = _proNavGuidance.CalculateDesiredAcceleration(
-                             _remoteControl.GetPosition(), // v: O.GetPosition()
-                             currentVelocity,              // w: ì
-                             CalculateMissileAcceleration(),        // x: x
-                             _destination,         // y: ï
-                             Vector3D.Zero,                 // z: Vector3D.Zero (Assuming target is stationary)
-                             naturalgravity                   // µ: ô
-                        );
+                //double missileAcceleration;
+                //Vector3D naturalgravity = _remoteControl.GetNaturalGravity();
+
+                //Vector3D desiredAcceleration;
+                //     desiredAcceleration = CalculateProportionalNavigation3D(currentPos, currentVelocity, targetPosition, UpdateAndGetVelocity(targetPosition, _previousTargetPoS), 5);
+                //double desiredAccelMagnitude = Magnitude(desiredAcceleration);
+                //double shipMaxAccelerationAtFullThrust = 250.0; // IMPORTANT: Replace 50.0 with your ship's actual max acceleration if it's different
+                //                                               // from the cap used in the PN command limiting step.
+                //                                               // If the '50' limit IS your ship's max accel, then this is correct.
+
+                //if (shipMaxAccelerationAtFullThrust > 0.0001) // Avoid division by zero if ship has no thrust
+                //{
+                //    thrustOverride = (float)(desiredAccelMagnitude / shipMaxAccelerationAtFullThrust);
+                //}
+
+                //// Clamp the value just in case, though mathematically it shouldn't exceed 1.0
+                //// if desiredAccelMagnitude was correctly capped by shipMaxAccelerationAtFullThrust earlier.
+                //thrustOverride = MathHelper.Clamp(thrustOverride, 0.0f, 1.0f);
 
 
-
-
-                
-
-                Vector3D toTarget = _destination - currentPos;
-                Vector3D toTargetDirection = Vector3D.Normalize(toTarget);
-
-                double alignment = Vector3D.Dot(_remoteControl.WorldMatrix.Forward, toTargetDirection);
-
-                double speedTowardsTarget = Vector3D.Dot(currentVelocity, toTargetDirection);
-                // Check alignment with target direction
-                double forwardAlignmentFactor = Vector3D.Dot(_remoteControl.WorldMatrix.Forward, toTargetDirection); // ý = Dot(O.WorldMatrix.Forward, ü)
-                                                                                                                              // Check closing speed towards target
-                double closingSpeed = Vector3D.Dot(currentVelocity, toTargetDirection); // þ = Dot(ì, ü)
-
-                // --- Constants ---
-                const double ALIGNMENT_THRESHOLD = 0.8;          // ÿ - General alignment threshold (Cosine value)
-                const double VERY_HIGH_ALIGNMENT_THRESHOLD = 0.9; // Corresponds to ~1.8 degrees off. Use 0.99996 for ~0.5 degrees.
-                                                                     // This is the threshold ABOVE which speed limit boost starts.
-
-                const float BASE_MAX_SPEED = 350.0f;              // Default maximum speed limit when alignment is good but not "very high"
-                const float BOOST_MAX_SPEED = 450.0f;             // The maximum speed limit achievable with perfect alignment (1.0)
-                const float MIN_SPEED_FOR_THRUST_INCREASE = 290.0f; // ā - Speed below which thrust increases
-                const float LOWER_SPEED_THRUST_RAMP = 245.0f;      // Speed below which thrust starts ramping up from zero
-
-// Get the current velocity direction (handle zero velocity)
-Vector3D velocityDirection = Vector3D.Zero;
-                double currentSpeed = currentVelocity.Length(); // Get the actual speed magnitude
-                if (currentSpeed > 0.01) // Use a small threshold to avoid issues with very low speeds
+                //Bitch Guidance
+                Vector3D targetPositionchanged = targetPosition;
+                if (distanceToTarget < startingDistance * 0.1)
                 {
-                    velocityDirection = Vector3D.Normalize(currentVelocity); // Normalize to get direction only
+                    targetPositionchanged = currentPos + Vector3D.Normalize(targetPosition - currentPos) * 2000;
                 }
-                // else velocityDirection remains Zero - ship isn't moving significantly
+                    //if (distanceToTarget > startingDistance * 0.5)
+                    //{
+                    //    Vector3D currentPosition = _remoteControl.GetPosition();
 
-                // Check alignment between VELOCITY direction and target direction
-                // Rename 'forwardAlignmentFactor' to 'velocityAlignmentFactor' for clarity
-                double velocityAlignmentFactor = 0; // Default to 0 if not moving
-                if (currentSpeed > 0.01)
+                    //    // Get the gravity vector at the current position
+                    //    Vector3D gravityVector = _remoteControl.GetNaturalGravity();
+
+                    //    // Check if gravity is present
+                    //    if (gravityVector.LengthSquared() == 0)
+                    //    {
+                    //        Echo("No gravity detected. Cannot calculate lofted trajectory.");
+                    //        return;
+                    //    }
+
+                    //    // "Up" direction is opposite to the gravity vector
+                    //    Vector3D upDirection = -Vector3D.Normalize(gravityVector);
+
+                    //    // Calculate the direction vector to the target
+                    //    Vector3D directionToTarget = targetPosition - currentPosition;
+
+                    //    // Project the direction vector onto the horizontal plane (perpendicular to up direction)
+                    //    Vector3D horizontalDirection = VectorMath.Reject(directionToTarget, upDirection);
+
+                    //    double horizontalDistance = horizontalDirection.Length();
+
+
+                    //    Vector3D horizontalDirectionNormalized = horizontalDirection / horizontalDistance;
+
+                    //    // Calculate the waypoint at a fraction of the horizontal distance to the target
+                    //    targetPositionchanged = currentPosition + horizontalDirectionNormalized * (horizontalDistance * 0.5);
+                    //    targetPositionchanged += upDirection * 9000;
+
+
+                    //}
+                    Vector3D targetdirection = targetPositionchanged - currentPos;
+                Vector3D instantlosrate;
+                Vector3D forwardVector = currentVelocity.Normalized();
+                Vector3D normalizedTargetDirection = targetdirection.Normalized();
+                double dotProduct = Vector3D.Dot(forwardVector, normalizedTargetDirection);
+
+                double denominator = targetdirection.LengthSquared();
+
+                if (denominator < 0.01)
                 {
-                    velocityAlignmentFactor = Vector3D.Dot(currentVelocity, toTargetDirection); // ý (new definition) = Dot(Normalized(ì), ü)
+                    if(denominator < 0.00001)
+                    {
+                        instantlosrate = Vector3D.Zero;
+                    }
+                    else
+                    {
+                        instantlosrate = (Vector3D.Cross(targetdirection, (currentVelocity - targetvelocity)) / targetdirection.LengthSquared())*0.5;
+                    }
                 }
-
-                // --- Input Variables (Assumed to be available) ---
-                // double forwardAlignmentFactor; // ý - Current alignment factor (e.g., Dot product result, 1.0 is perfect)
-                // double closingSpeed;         // þ - Current speed towards waypoint
-                // int waypointsCount;          // L.Count - Number of waypoints remaining
-
-                // --- Define Constants ---
-               const float REQUIRED_MIN_CLOSING_SPEED = 100.0f; // *** NEW: Minimum required speed towards target when aligned ***
-
-                // --- Assume these are calculated elsewhere ---
-                // double velocityAlignmentFactor: Dot product between ship's forward vector and velocity vector (normalized).
-                //                                Ranges from -1 (moving backward) to 1 (moving forward).
-                // double closingSpeed: The component of the ship's velocity directly towards the target waypoint/enemy (in m/s).
-                //                      Positive means moving towards, negative means moving away.
-                // List<Waypoint> _waypoints: A list representing the path or targets.
-                // MathHelper.Clamp: A function Clamp(value, min, max).
-                // Math.Max: A function Max(val1, val2).
-
-                // Example values for testing:
-                int waypointCount = 2;             // Assume _waypoints.Count = 2
-
-                // --- Logic ---
-                float thrustOverride = 1.0f; // n - Default to full thrust unless adjusted
-                float currentMaxSpeed = BASE_MAX_SPEED; // Start with the base speed limit
-
-               if(currentVelocity.Length() > 180)
+                else
                 {
-                    thrustOverride = 0.1f;
+                    instantlosrate = Vector3D.Cross(targetdirection, (currentVelocity - targetvelocity)) / targetdirection.LengthSquared();
+
+                }
+                double roll = 0;
+                MatrixD worldMatrix = _remoteControl.WorldMatrix;
+                Vector3D upVector = worldMatrix.Up;
+                Vector3D leftVector = worldMatrix.Left;
+                Vector3D gravity = _remoteControl.GetNaturalGravity();
+                bool inGravity = gravity.LengthSquared() > 0;
+                Vector3D gravityDirection = inGravity ? Vector3D.Normalize(gravity) : Vector3D.Zero;
+
+                if (inGravity)
+                {
+                    roll =
+                        Math.Atan2(
+                            Vector3D.Dot(leftVector, gravityDirection),
+                            Vector3D.Dot(upVector, gravityDirection)
+                        ) * (180 / Math.PI);
+
+                    // Normalize roll to [0, 360)
+                    // 180 = gravity down (flying normal)
+                    // 0 = gravity up (flying inverted)
+                    if (roll < 0)
+                        roll += 360;
                 }
 
+                float rollFloat = 0;
+                float upsidedown = 1;
+                if (roll <= 90 || roll >= 270)
+                {
+                    upsidedown = -1;
+                }
+                //Vector3D desiredAcceleration = 3*Vector3D.Cross(currentVelocity, instantlosrate);
+
+                Vector3D desiredAcceleration = 5 * Vector3D.Cross(currentVelocity, instantlosrate);
+                if (distanceToTarget < startingDistance * 0.01 || distanceToTarget < 300)
+                {
+                    desiredAcceleration = Vector3D.Zero;
+                }
                 // --- Use the results ---
                 // Apply thrust based on 'thrustOverride'
                 // Maybe display 'currentMaxSpeed' or use it for other decisions.
                 _remoteControl.DampenersOverride = false;
                 foreach (var thruster in _thrusters)
-                    thruster.ThrustOverridePercentage = thrustOverride;
-
+                {
+                    if (currentVelocity.Length() < 200)
+                    {
+                        thruster.ThrustOverridePercentage = 1f;
+                    }
+                    else
+                    {
+                        thruster.ThrustOverridePercentage = 0.1f;
+                    }
+                    if (desiredAcceleration.Length() > 5 && distanceToTarget >= 1000)
+                    {
+                        thruster.ThrustOverridePercentage = 0.15f;
+                    }
+                    if (currentVelocity.Length() > 270)
+                    {
+                        thruster.ThrustOverridePercentage = 0f;
+                    }
+                }
                 // Compute the rotation vector
                 // Proceed with rotation and gyro control using desiredAcceleration as calculated
-                Vector3D rotationVector = ComputeRotationVector(desiredAcceleration, _remoteControl.WorldMatrix, currentVelocity.Length());
-                ApplyGyroOverride(rotationVector, _gyros, _remoteControl.WorldMatrix);
+                ApplyGyroOverride(desiredAcceleration, _gyros, _remoteControl.WorldMatrix, distanceToTarget, startingDistance);
                 double speed = currentVelocity.Length();
 
 
-
+                _previousTargetPoS = targetPosition;
 
                 if (lcdMain != null)
                 {
-                    DisplayOnLCD(lcdMain, distanceToTarget, startingDistance, speed, _ticks);
+                    DisplayOnLCD(lcdMain, distanceToTarget, startingDistance, speed, _ticks, desiredAcceleration, desiredAcceleration);
                 }
             }
         }
@@ -703,27 +853,24 @@ Vector3D velocityDirection = Vector3D.Zero;
             // Calculate acceleration (a = F / m)
             return missileMass > 0 ? totalThrust / missileMass : 0;
         }
-        Vector3D ComputeRotationVector(Vector3D desiredAcceleration, MatrixD worldMatrix, double currentSpeed)
+        private static bool IsVectorPracticallyZero(Vector3D vector, double epsilon = 1e-7)
         {
-            Vector3D desiredDirection = Vector3D.Normalize(desiredAcceleration);
-            Vector3D currentDirection = worldMatrix.Forward;
-
-            Vector3D rotationAxis = Vector3D.Cross(currentDirection, desiredDirection);
-            double angle = Math.Acos(MathHelper.Clamp(Vector3D.Dot(currentDirection, desiredDirection), -1, 1));
-
-            if (Math.Abs(angle) < 1e-6) return Vector3D.Zero;
-
-
-            rotationAxis = Vector3D.Normalize(rotationAxis);
-
-            // Dynamically scaled rotation speed
-            double rotationSpeed = angle * 60;
-
-            return rotationAxis * rotationSpeed;
-
+            return vector.LengthSquared() < epsilon * epsilon; // Compare squared magnitudes to avoid Sqrt
         }
 
+        private const double Epsilon = 1e-6; // Small tolerance for floating-point comparisons
 
+        /// <summary>
+        /// Computes the rotation vector required to align a current forward vector with a target forward vector.
+        /// The resulting vector's direction is the axis of rotation, and its magnitude is the angle in radians.
+        /// This version removes experimental trim logic and focuses on core rotation.
+        /// </summary>
+        /// <param name="currentForward">The object's current forward direction vector. Should ideally be a unit vector.</param>
+        /// <param name="rawTargetDirection">The desired target direction vector (e.g., from guidance). This vector will be normalized internally.</param>
+        /// <param name="objectReferenceUp">The object's current "up" vector. This is used to disambiguate the rotation axis for 180-degree turns.
+        /// It should ideally be orthogonal to currentForward.</param>
+        /// <returns>A Vector3D representing the rotation axis scaled by the rotation angle in radians.
+        /// Returns Vector3D.Zero if no rotation is needed, if inputs are invalid, or if a rotation axis cannot be determined.</returns>
         void CheckForGPSAndStart()
         {
             programmableBlock = GridTerminalSystem.GetBlockWithName("JETOS Programmable Block") as IMyProgrammableBlock;
@@ -905,23 +1052,61 @@ Vector3D velocityDirection = Vector3D.Zero;
             return Math.Acos(dotProduct);
         }
 
-        void ApplyGyroOverride(Vector3D worldAngularVelocity, List<IMyGyro> gyros, MatrixD shipWorldMatrix) // ù(ø, ĥ, Ć)
+        void ApplyGyroOverride(Vector3D worldAngularVelocity, List<IMyGyro> gyros, MatrixD shipWorldMatrix, double distanceToTarget, double startingDistance) // ù(ø, ĥ, Ć)
         {
-            foreach (var gyro in gyros) // foreach(var Ħ in ĥ)
+            foreach (var gyro in gyros) 
             {
-                // Transform world angular velocity to gyro's local frame
-                var localAngularVelocity = Vector3D.TransformNormal(worldAngularVelocity, MatrixD.Transpose(gyro.WorldMatrix)); // ħ = TransformNormal(ø, Transpose(Ħ.WorldMatrix))
+                var localAngularVelocity = Vector3D.TransformNormal(worldAngularVelocity, MatrixD.Transpose(gyro.WorldMatrix)); 
 
-                // Apply to pitch, yaw, roll (might need sign adjustments depending on gyro orientation)
-                float pitch = (float)(-localAngularVelocity.X); // Ĩ = (float)(-ħ.X)
-                float yaw = (float)(-localAngularVelocity.Y);   // ĩ = (float)(-ħ.Y)
-                float roll = (float)(-localAngularVelocity.Z);  // Ī = (float)(-ħ.Z)
+                float pitch = (float)(localAngularVelocity.Y); 
+                float yaw = (float)(localAngularVelocity.X);
+                float roll = (float)(localAngularVelocity.Z);
+                double roll1 = 0;
+                MatrixD worldMatrix = _remoteControl.WorldMatrix;
+                Vector3D forwardVector = worldMatrix.Forward;
+                Vector3D upVector = worldMatrix.Up;
+                Vector3D leftVector = worldMatrix.Left;
+                Vector3D gravity = _remoteControl.GetNaturalGravity();
+                bool inGravity = gravity.LengthSquared() > 0;
+                Vector3D gravityDirection = inGravity ? Vector3D.Normalize(gravity) : Vector3D.Zero;
 
-                gyro.Enabled = true; // Ħ.Enabled = true
-                gyro.Pitch = pitch; // Ħ.Pitch = Ĩ
-                gyro.Yaw = yaw;     // Ħ.Yaw = ĩ
-                gyro.Roll = roll;   // Ħ.Roll = Ī
-                gyro.GyroOverride = true; // Ħ.GyroOverride = true
+                if (inGravity)
+                {
+                    roll1 =
+                        Math.Atan2(
+                            Vector3D.Dot(leftVector, gravityDirection),
+                            Vector3D.Dot(upVector, gravityDirection)
+                        ) * (180 / Math.PI);
+
+                    // Normalize roll to [0, 360)
+                    // 180 = gravity down (flying normal)
+                    // 0 = gravity up (flying inverted)
+                    if (roll1 < 0)
+                        roll1 += 360;
+                }
+
+                float rollFloat = 0;
+                float upsidedown = 1;
+                if (roll1 < 175)
+                {
+                    rollFloat = -0.1f;
+                }
+                if (roll1 >= 185)
+                {
+                    rollFloat = 0.1f;
+                }
+                if(roll1 <= 90 || roll >= 270)
+                {
+                    upsidedown = -1;
+                }
+                gyro.Enabled = true;
+                if (distanceToTarget > startingDistance * 0.33) {
+                    pitch = 1f * upsidedown;
+                }
+                    gyro.Pitch = -pitch;
+                gyro.Yaw = roll;
+                gyro.Roll = yaw;
+                gyro.GyroOverride = true;
             }
         }
 
@@ -949,7 +1134,7 @@ Vector3D velocityDirection = Vector3D.Zero;
             }
             return closestBlock;
         }
-
+        
         private int GetBayNumberFromMergeBlock(IMyShipMergeBlock mergeBlock)
         {
             string name = mergeBlock.CustomName;
@@ -1005,8 +1190,147 @@ Vector3D velocityDirection = Vector3D.Zero;
                 warhead.Detonate();
             }
         }
+        private const int GridSize = 15; // Must be odd for a clear center. 7x7 grid.
+        private const char EmptyChar = '.';
+        private const char CenterChar = 'O';
+        private const char TargetChar = '*';
 
-        public void DisplayOnLCD(IMyTextSurface lcd, double distanceToTarget, double startingDistance, double currentVelocity, int _ticks)
+        /// <summary>
+        /// Helper method to generate an ASCII art visualization for a single 2D plane.
+        /// (This method remains unchanged from your original provided code)
+        /// </summary>
+        private static string GeneratePlaneVisualization(
+            double val1, char val1AxisLabelPositive, char val1AxisLabelNegative,
+            double val2, char val2AxisLabelPositive, char val2AxisLabelNegative,
+            string planeTitle,
+            char val1DimChar, char val2DimChar)
+        {
+            StringBuilder sbPlane = new StringBuilder();
+            char[,] grid = new char[GridSize, GridSize];
+            int center = GridSize / 2;
+
+            // Initialize grid
+            for (int r = 0; r < GridSize; r++)
+            {
+                for (int c = 0; c < GridSize; c++)
+                {
+                    grid[r, c] = EmptyChar;
+                }
+            }
+
+            // Mark center
+            grid[center, center] = CenterChar;
+
+            // Calculate target cell coordinates
+            // val1 maps to columns (horizontal), val2 maps to rows (vertical)
+            // For display, +val1 is right, +val2 is up (which means smaller row index)
+            int targetCol = center + (int)Math.Round(val1);
+            int targetRow = center - (int)Math.Round(val2); // Invert val2 for typical screen Y-axis (up is smaller index)
+
+            // Clamp target coordinates to grid boundaries
+            targetCol = Math.Max(0, Math.Min(GridSize - 1, targetCol));
+            targetRow = Math.Max(0, Math.Min(GridSize - 1, targetRow));
+
+            // Mark target if it's not the center
+            if (targetRow != center || targetCol != center)
+            {
+                grid[targetRow, targetCol] = TargetChar;
+            }
+
+            // Build the string representation of the grid
+            sbPlane.AppendLine(planeTitle);
+
+            // Top axis label (for val1)
+            sbPlane.Append("  "); // Indent for vertical axis labels
+            for (int c = 0; c < GridSize; c++)
+            {
+                if (c == 0) sbPlane.Append(val1AxisLabelNegative);
+                else if (c == GridSize - 1) sbPlane.Append(val1AxisLabelPositive);
+                else if (c == center) sbPlane.Append(val1DimChar);
+                else sbPlane.Append(" ");
+            }
+            sbPlane.AppendLine();
+
+            // Grid rows with side axis labels (for val2)
+            for (int r = 0; r < GridSize; r++)
+            {
+                // Side axis label
+                if (r == 0) sbPlane.Append(val2AxisLabelPositive).Append(" ");
+                else if (r == GridSize - 1) sbPlane.Append(val2AxisLabelNegative).Append(" ");
+                else if (r == center) sbPlane.Append(val2DimChar).Append(" ");
+                else sbPlane.Append("  ");
+
+                // Grid content for the current row
+                for (int c = 0; c < GridSize; c++)
+                {
+                    sbPlane.Append(grid[r, c]);
+                }
+                sbPlane.AppendLine();
+            }
+            return sbPlane.ToString();
+        }
+
+        /// <summary>
+        /// Generates a simplified ASCII visualization for desired nose movement (Pitch and Yaw).
+        /// </summary>
+        /// <param name="desiredRotation">The Vector3D to visualize.
+        /// Assumes Y component is Pitch and Z component is Yaw.</param>
+        /// <returns>A string containing the ASCII visualization for Pitch and Yaw.</returns>
+        public static string GetRotationVisualizationText(Vector3D desiredRotation, Vector3D desiredacc)
+        {
+            StringBuilder result = new StringBuilder();
+            double maxDisplayMagnitude = (GridSize - 1) / 2.0;
+
+            // Assuming desiredRotation.X is Roll, .Y is Pitch, .Z is Yaw
+            double vRoll = desiredRotation.X;
+            double vPitch = desiredRotation.Y;
+            double vYaw = desiredRotation.Z;
+
+            // Determine the largest component (Pitch or Yaw) to scale if too large for the grid
+            double epsilon = 1e-9;
+            double relevantMaxAbs = 0;
+            if (Math.Abs(vPitch) > epsilon) relevantMaxAbs = Math.Max(relevantMaxAbs, Math.Abs(vPitch));
+            if (Math.Abs(vYaw) > epsilon) relevantMaxAbs = Math.Max(relevantMaxAbs, Math.Abs(vYaw));
+
+            double scaleFactor = 1.0;
+            if (relevantMaxAbs > epsilon && relevantMaxAbs > maxDisplayMagnitude)
+            {
+                scaleFactor = maxDisplayMagnitude / relevantMaxAbs;
+            }
+
+            double displayPitch = vPitch * scaleFactor;
+            double displayYaw = vYaw * scaleFactor;
+
+            result.AppendLine("Desired Nose Movement (O=Origin, *=Target):");
+            result.AppendLine($"Input Rotation: Roll={vRoll:F2}, Pitch={vPitch:F2}, Yaw={vYaw:F2}");
+            result.AppendLine($"Input Speed: X={desiredacc.X:F2}, Y={desiredacc.Y:F2}, Z={desiredacc.Z:F2}");
+            if (Math.Abs(scaleFactor - 1.0) > epsilon) // Only show scaling info if actually scaled
+            {
+                result.AppendLine($"Scaled for Display (Factor: {scaleFactor:F2}): dPitch={displayPitch:F2}, dYaw={displayYaw:F2}");
+            }
+            else
+            {
+                result.AppendLine($"Display Values: Pitch={displayPitch:F2}, Yaw={displayYaw:F2}");
+            }
+            result.AppendLine();
+
+            // Visualize Yaw (Left/Right) as val1 (horizontal) and Pitch (Up/Down) as val2 (vertical)
+            // Positive Yaw ('R') to the right, Positive Pitch ('U') upwards on the grid.
+            result.Append(GeneratePlaneVisualization(
+                displayYaw,               // val1 (horizontal: Yaw)
+                'R',                      // val1AxisLabelPositive (Yaw Right)
+                'L',                      // val1AxisLabelNegative (Yaw Left)
+                displayPitch,             // val2 (vertical: Pitch)
+                'U',                      // val2AxisLabelPositive (Pitch Up)
+                'D',                      // val2AxisLabelNegative (Pitch Down)
+                "Nose Aim (U/D: Pitch, L/R: Yaw)",
+                'Y',                      // val1DimChar (Yaw axis identifier)
+                'P'                       // val2DimChar (Pitch axis identifier)
+            ));
+
+            return result.ToString();
+        }
+        public void DisplayOnLCD(IMyTextSurface lcd, double distanceToTarget, double startingDistance, double currentVelocity, int _ticks, Vector3D gyros, Vector3D desiredacc)
         {
             int barLength = 25;
             float fontSize = 0.5f;
@@ -1156,10 +1480,10 @@ Vector3D velocityDirection = Vector3D.Zero;
 
                 // Center and space the bottom texts
                 string bottomLeftText = $"  {bottomLeftLabel}{distanceToTarget.ToString("0.0")} m".PadRight(10) + "\n" +
-                                        $"  {target}".PadRight(10) + "\n" +
+                                        $"  {target}X{desiredacc.X.ToString("0.00")}Y{desiredacc.Y.ToString("0.00")}Z{desiredacc.Z.ToString("0.00")}".PadRight(10) + "\n" +
                                         $"  {bottomRightLabel}{startingDistance.ToString("0.0")} m".PadRight(10) + "";
                 string progressText = $"  {progressLabel}{distanceBar}".PadRight(25);
-                string centerMessage = $"  {scrollingMessage}".PadRight(25);
+                string centerMessage = $"  {scrollingMessage} ".PadRight(25);
                 string quoteMessage = $"  {scrollingQuote}".PadRight(25);
 
                 // Render the overlapping X's in ASCII
