@@ -1,0 +1,1461 @@
+  //Introduction
+  #region Introduction
+  /*Introduction
+  ----------------------
+  Hello and thank you for downloading Rdavs Guided Missile Script Gen 3
+  This Script adds an advanced tracking algorithm & Radar Display for
+  player made missiles that excels in dogfights and ship to ship warfare.
+
+  Simply paste or install this code into the programmable block and follow
+  the on screen guidance in the terminal to set the script up.
+
+  Quick tips;
+  - Just call everything on your missile #A#, its faster this way!
+  - You can use a big LCD to display tracking radar just call an LCD #A#
+  - The script requires a flight AI block and a combat offensive ai block called #A#
+  - Put your indicator light (called#A#) on the outside of the ship so you can see lock in 3rd person
+  - Use the argument 'Fire' to launch a missile
+  - Use the argument 'Boost' to enable boost mode for hunting supermanuverable ships, (0.2ms performance)
+
+  Additional information can be found on the workshop page for the script
+  Any questions or queries don't hesitate to contact me!
+
+  Rdav 07/06/2025
+
+  ChangeLog:
+   * Release Version 1.0
+   * Version 1.01 - Fixed bug with small intermediate detach grids & added default targeting option
+   * Version 1.02 - Added toggle for cockpit rename, added autolaunching, improved beam riding
+   * Version 1.03 - Thrust clamp adjustment, auto connect for connectors, LCD selection, gravity correction, self construct force, ordered launches
+   */
+
+  //--------------------- Player Editable Values (User Edits Section) -----------------------------
+
+
+  //CHANGE MISSILE TAG HERE:
+  //Changes The prefix tag that the script uses to search for components
+  string MissileTag = "#A#";
+
+  //Warhead Automatic Detonation Range
+  const float FuseDistance = 6; //automatically detonates warheads, use 23 for large grid missiles for best results!
+
+  //Launch Parameters (both times in ticks)
+  const int IGNITEDELAY = 10; //ticks before engaging the engines
+  const int GUIDEDELAY = 50; //ticks before engaging guidance
+
+  //AutoLaunch Settings
+  const bool EnableAutoLaunch = false; //enable for autolaunching
+  const int TicksBetweenAutoLaunch = 60; //change this for automatic launching
+
+  //Miscellaneous Settings
+  const bool UseDefaultTargeting = false; // set this to true to enable 'default' targeting subsystems by default
+  const bool RenameCockpit = true; //Renames the cockpit the script uses to help  diagnose issues
+  const int MissileLCD = 0; //LCD in the cockpit to use (keep this 0 unless you want it on a different screen)
+  const int GravityAggressiveness = 1; //Alter this (0.5 - 4) to change how aggressive gravity counteraction is, good for firing at ground targets.
+
+  bool Autoconnect = false;//Automatically connects missile connectors so its easier to use in survival
+  bool OnlyUseBlocksOnSameConstruct = false; //Use this to force script to only use same construct blocks (ie ignore connector docked stuff)
+  bool OrderedLaunching = false; //script will automatically launch ordered via name, (the order they appear in the terminal) use #A# 001, #A# 002, ...., #A# 099
+
+  //-------------- Don't Touch Anything Beneath This Line --------------------
+
+  string VERSION = "1.03";
+
+  //Parameters For Tracking State
+  public Vector3D TrackedTargetLocation;
+  public Vector3D TrackedTargetVelocity;
+  public int MissileRemainingCount;
+  int MergeSearchRefreshTimer = 0;
+  List<MISSILE> MISSILES = new List<MISSILE>();
+  string Lstrundata = "Please ensure you have read the \n setup and hints & tips, found within \n the custom data of this block\n";
+  static MyGridProgram Program_local;
+  int AutoLaunchTimer = 0;
+
+  //Shipside Required Blocks For Functionality
+  RadarTrackingModule ThisTracker;
+  TrackingDisplay GUIPanel;
+  IMyLightingBlock Alarm;
+  IMyShipController RC;
+
+
+  #endregion
+
+  //---
+
+  //Radar Tracking System
+  #region Radar Tracking Module
+  class RadarTrackingModule
+  {
+      //===============================================================================================
+      //This Is A Pretty Generic Targeting Class, I Have Kept It Relatively CLean And Understandable 
+      //At Runtime It Is Fairly Lightweight, But Don't Spam It a call to 'position' does invoke some logic
+      //- needs you to update the tracking info every frame 
+      //- will throw nullreference if the blocks are destroyed
+      //- Use the boost mode to use monkaspeed tracking
+
+      //----------------------------------------------------------------------------
+
+      //Used Instead Of A Tuple (keen ree)
+      struct TrackingPoint
+      {
+          public readonly Vector3D Position;
+          public readonly double Timestamp;
+          public TrackingPoint(Vector3D position, double timestamp)
+          {
+              this.Position = position;
+              this.Timestamp = timestamp;
+          }
+      }
+
+      //Keeps Record Of The Flight Module
+      IMyFlightMovementBlock L_FlightBlock;
+      IMyOffensiveCombatBlock L_CombatBLock;
+      public bool BoostMode = false;
+
+      // Store last two (position, timestamp) entries 
+      TrackingPoint p1;
+      TrackingPoint p0;
+
+      //Counting Positions
+      public long CurrentTime;
+      public int CurrentTick;
+      const int ForcedRefreshRate = 40; //this is used to force a position relog on static grids
+
+      //----------------------------------------------------------------------------
+
+      /// <summary>
+      /// Constructor, takes 
+      /// </summary>
+      /// <param name="LBlock_F">The flight block to use</param>
+      /// <param name="LBlockC">The combat block to use</param>
+      public RadarTrackingModule(IMyFlightMovementBlock LBlock_F, IMyOffensiveCombatBlock LBlockC)
+      {
+          //Sets
+          L_FlightBlock = LBlock_F;
+          L_CombatBLock = LBlockC;
+
+          //AI Move Block Settings Used For Continual Tracking
+          L_FlightBlock.Enabled = false;
+          L_FlightBlock.MinimalAltitude = 10; //possibly could be larger
+          L_FlightBlock.PrecisionMode = false;
+          L_FlightBlock.SpeedLimit = 400;
+          L_FlightBlock.AlignToPGravity = false;
+          L_FlightBlock.CollisionAvoidance = false;
+          L_FlightBlock.ApplyAction("ActivateBehavior_On");
+
+          //AI combat block settings
+          L_CombatBLock.Enabled = true;
+          L_CombatBLock.UpdateTargetInterval = 4;
+          L_CombatBLock.SearchEnemyComponent.TargetingLockOptions = VRage.Game.ModAPI.Ingame.MyGridTargetingRelationFiltering.Enemy;
+          L_CombatBLock.SelectedAttackPattern = 3; //Sets To Intercept Mode
+          L_CombatBLock.SetValue<long>("OffensiveCombatIntercept_GuidanceType", 0); // 1 target prediction, 0 basic
+          L_CombatBLock.SetValueBool("OffensiveCombatIntercept_OverrideCollisionAvoidance", true); //Sets To Ignore All Collision Detection
+          L_CombatBLock.ApplyAction("ActivateBehavior_On");
+          if (!UseDefaultTargeting)
+          { L_CombatBLock.ApplyAction("SetTargetingGroup_Weapons"); }
+          L_CombatBLock.ApplyAction("SetTargetPriority_Largest");
+      }
+
+      /// <summary>
+      //Call This Before Using Any Of The Properties, Updates Position
+      /// </summary>
+      public void UpdateTracking(long CurrentPBTime_Ticks)
+      {
+          //Updates Time
+          CurrentTime = CurrentPBTime_Ticks;
+
+          // Retrieves the flight block's waypoint
+          IMyAutopilotWaypoint currentWaypoint = L_FlightBlock.CurrentWaypoint;
+
+          // Null check, or check if block is currently tracking
+          if (currentWaypoint != null)
+          {
+              //NB this can be up to 2 ticks out of date due to the asynch nature of this
+              Vector3D TargetPosition = currentWaypoint.Matrix.Translation;
+
+              //Need To Use This As Otherwise Gives False Data
+              if (TargetPosition != p0.Position || CurrentTick > ForcedRefreshRate)
+              {
+                  // Shift historical data
+                  p1 = p0;
+                  p0 = new TrackingPoint(TargetPosition, CurrentTime);
+
+                  //Resets Counter
+                  CurrentTick = 0;
+              }
+              else
+              {
+                  //Increments
+                  CurrentTick++;
+              }
+          }
+      }
+
+      /// <summary>
+      /// Gets the most recent velocity vector.
+      /// </summary>
+      public Vector3D TargetVelocity
+      {
+          get
+          {
+              // Extract position and time from the stored tracking points
+              Vector3D pos1 = p1.Position;
+              double time1 = p1.Timestamp;
+
+              Vector3D pos0 = p0.Position;
+              double time0 = p0.Timestamp;
+
+              //Calculates protecting against zero time errors (would give NaN)
+              double dt = time0 - time1;
+              if (dt <= 0) return Vector3D.Zero;
+
+              //Returns
+              return (pos0 - pos1) / (double)dt;
+          }
+      }
+
+      /// <summary>
+      /// Predicts the target's position using current velocity and acceleration.
+      /// </summary>
+      public Vector3D TargetPosition
+      {
+          get
+          {
+
+              //This Is Emergency Ultra Burn, Use Only In Emergencies As Very Performance Intensive
+              if (BoostMode)
+              {
+                  L_CombatBLock.Enabled = false;
+                  L_CombatBLock.Enabled = true;
+                  var CurrentWaypoint = L_FlightBlock.CurrentWaypoint;
+                  var positionwaypoint = CurrentWaypoint.Matrix.GetRow(3);
+                  return new Vector3D(positionwaypoint.X, positionwaypoint.Y, positionwaypoint.Z);
+              }
+
+              // Extracts Current Position
+              Vector3D lastPosition = p0.Position;
+              double lastTime = p0.Timestamp;
+
+              //Gets V and A
+              Vector3D velocity = TargetVelocity;
+
+              //Timestep
+              double dt = (double)(CurrentTime - lastTime);
+
+              //S1 = S0 + UT + 0.5AT^2 (simple suvat equation)
+              return lastPosition + velocity * dt; //found is more stable withoput acceleration term, as its 1.6s of error
+          }
+      }
+
+      //----------------------------------------------------------------------------
+
+      /// <summary>
+      /// Tells You If Is Tracking Or Not, If This Is True It Is Actively Seeking
+      /// </summary>
+      public bool IsTracking
+      {
+          get
+          {
+              return L_CombatBLock.SearchEnemyComponent.FoundEnemyId == null ? false : true;
+          }
+      }
+
+      /// <summary>
+      /// Tells You Tracked Object Name
+      /// </summary>
+      public string TrackedObjectName
+      {
+          get
+          {
+              //this is 
+              string detailedInfo = L_CombatBLock.DetailedInfo;
+
+              // Split by new lines
+              var lines = detailedInfo.Split('\n');
+
+              return lines[0];
+          }
+      }
+
+      /// <summary>
+      /// Checks State Of Blocks Internal
+      /// </summary>
+      public bool CheckWorking(out string errormsg)
+      {
+          if (L_FlightBlock == null || L_FlightBlock.CubeGrid.GetCubeBlock(L_FlightBlock.Position) == null || !L_FlightBlock.IsWorking)
+          { errormsg = " ~ AI Flight Block Not Found,\nInstall Block And Press Recompile"; return false; }
+          if (L_CombatBLock == null || L_CombatBLock.CubeGrid.GetCubeBlock(L_CombatBLock.Position) == null || !L_CombatBLock.IsWorking)
+          { errormsg = " ~ AI Combat Block Not Found,\nInstall Block And Press Recompile"; return false; }
+          errormsg = null;
+          return true;
+      }
+
+      /// <summary>
+      /// Tells You What Is Setup For Line 1 (largest, smallest, closest)
+      /// </summary>
+      public string GetLine1Info()
+      {
+          return L_CombatBLock.TargetPriority + ""; 
+      }
+
+      /// <summary>
+      /// Tells You What Is Setup For Line 2 (weapons, thrusters etc)
+      /// </summary>
+      public string GetLine2Info()
+      {
+          return L_CombatBLock.SearchEnemyComponent.SubsystemsToDestroy + "";
+      }
+
+      //----------------------------------------------------------------------------
+
+  }
+  #endregion
+
+  //Tracking Display System
+  #region Tracking Display Module
+  public class TrackingDisplay
+  {
+      static IMyTextSurface RenderingSurface;
+
+      //Description Of Size And Offset
+      RectangleF _viewport; //Offset And Location Of Actual Rendering Surface
+
+      //This Allows You To Use ScreenSpace Coordinates For Sprite Defintion
+      Vector2 SurfaceScaleToScreenSpace;
+      Vector2 SurfOffsetToScreenSpace;
+
+      //Used For Defining Translations From DesignSpace
+      const int DesignSpaceX = 512;
+      const int DesignSpaceY = 512;
+
+      //Constant Names
+      const string SolidSquare = "SquareSimple";
+      const string SquareHollow = "SquareHollow";
+      const string SemiCircle = "SemiCircle";
+      const string CircleHollow = "CircleHollow";
+      const string Circle = "Circle";
+      const string RightTriangle = "RightTriangle";
+      const string Triangle = "Triangle";
+
+
+      public TrackingDisplay(IMyTextSurface TextSurface)
+      {
+          RenderingSurface = TextSurface;
+          TextSurface.ContentType = VRage.Game.GUI.TextPanel.ContentType.SCRIPT;
+          //RenderingSurface.Script = "TSS_FactionIcon";
+          TextSurface.Script = "";
+
+          TextSurface.ScriptBackgroundColor = Color.Black;
+
+          // Calculate the viewport offset and dimension by centering the surface size onto the texture size
+          _viewport = new RectangleF(
+              (TextSurface.TextureSize - TextSurface.SurfaceSize) / 2f,
+              TextSurface.SurfaceSize
+          );
+
+          //converts The scale Based On Y
+          //float MinScale = Math.Min(TextSurface.SurfaceSize.X, TextSurface.SurfaceSize.Y);
+
+          ////These Convert From Screen Space To Surface Space Pretty Ubiquitously
+          //SurfaceScaleToScreenSpace = new Vector2(MinScale, MinScale); //TextSurface.SurfaceSize;
+          //SurfOffsetToScreenSpace = (TextSurface.TextureSize - TextSurface.SurfaceSize) / 2f;
+
+          Vector2 surfaceSize = TextSurface.SurfaceSize;
+          Vector2 textureSize = TextSurface.TextureSize;
+
+          // Enforce square scale — scale both X and Y based on the smaller side
+          float minScale = Math.Min(surfaceSize.X, surfaceSize.Y);
+          SurfaceScaleToScreenSpace = new Vector2(minScale, minScale);
+
+          // Center the square drawing area within the texture
+          Vector2 squareRenderSize = SurfaceScaleToScreenSpace;
+          SurfOffsetToScreenSpace = (textureSize - squareRenderSize) / 2f;
+
+
+      }
+
+
+      /// <summary>
+      /// Draws A Line Using Shifted Rectangle
+      /// </summary>
+      public static MySprite DrawLine(Vector2 pt1, Vector2 pt2, float thickness, Color colour)
+      {
+          //Gets Average Position For Rectangle Center
+          Vector2 position = 0.5f * (pt1 + pt2);
+          Vector2 diff = pt1 - pt2;
+          float rectlength = diff.Length();
+
+          //Prevention for NAN
+          if (rectlength > 0)
+              diff /= rectlength;
+
+          //Defines Size
+          Vector2 rectsize = new Vector2(rectlength, thickness);
+
+          //Defines Angle And Rotates to Fix
+          float angle = (float)Math.Acos(Vector2.Dot(diff, Vector2.UnitX));
+          angle *= Math.Sign(Vector2.Dot(diff, Vector2.UnitY));
+
+          //Creates Sprite
+          MySprite linesprite = MySprite.CreateSprite(SolidSquare, position, rectsize);
+          linesprite.RotationOrScale = angle;
+          linesprite.Color = colour;
+
+          //Returns
+          return linesprite;
+
+      }
+
+      //Draws Rectangle from topleft + x,y,z, use defaults for otherwise drawing
+      public static MySprite DrawRectangle_FromTL(Vector2 topLeft, float dimx, float dimy, Color colour, bool fill)
+      {
+          //Gets Average Position For Rectangle Center
+          Vector2 rectSize = new Vector2(dimx, dimy);
+          Vector2 pt2 = topLeft + rectSize;
+          Vector2 position = 0.5f * (topLeft + pt2);
+          Vector2 diff = topLeft - pt2;
+
+          //Creates Sprite
+          string type = SquareHollow;
+          if (fill)
+          { type = SolidSquare; }
+
+          //Creates Sprite
+          MySprite recsprite = MySprite.CreateSprite(type, position, rectSize);
+          recsprite.Color = colour;
+
+          //Returns
+          return recsprite;
+      }
+
+      //Draws Rectangle from topleft + x,y,z, use defaults for otherwise drawing
+      public static MySprite DrawRectangle_FromCntr(Vector2 center, float dimx, float dimy, Color colour, bool fill)
+      {
+          //Gets Average Position For Rectangle Center
+          Vector2 rectSize = new Vector2(dimx, dimy);
+
+          //Creates Sprite
+          string type = SquareHollow;
+          if (fill)
+          { type = SolidSquare; }
+
+          //Creates Sprite
+          MySprite recsprite = MySprite.CreateSprite(type, center, rectSize);
+          recsprite.Color = colour;
+
+          //Returns
+          return recsprite;
+      }
+
+      //Draws Rectangle from topleft + x,y,z, use defaults for otherwise drawing
+      public static MySprite DrawCircle(Vector2 Center, float radius, Color colour, bool fill)
+      {
+          //Creates Sprite
+          string type = CircleHollow;
+          if (fill)
+          { type = Circle; }
+
+          MySprite recsprite = MySprite.CreateSprite(type, Center, new Vector2(radius * 2, radius * 2));
+          recsprite.Color = colour;
+
+          //Returns
+          return recsprite;
+      }
+
+      //Draws Rectangle from topleft + x,y,z, use defaults for otherwise drawing
+      public static List<MySprite> DrawHollowCircle(Vector2 Center, float radius, float thickness, Color colour)
+      {
+          //Creates Sprite
+          string type = Circle;
+
+          MySprite circsprite = MySprite.CreateSprite(type, Center, new Vector2(radius * 2, radius * 2));
+          circsprite.Color = colour;
+          MySprite circspritecore = MySprite.CreateSprite(type, Center, new Vector2(radius * 2 - thickness, radius * 2 - thickness));
+          circspritecore.Color = RenderingSurface.ScriptBackgroundColor;
+
+          //Returns
+          return new List<MySprite>() { circsprite, circspritecore };
+      }
+
+      //Draws text at a given position with optional font size, alignment, and color
+      public static MySprite DrawText(string text, Vector2 position, Color color, float scale = 1.0f, TextAlignment alignment = TextAlignment.CENTER)
+      {
+          MySprite textSprite = new MySprite()
+          {
+              Type = SpriteType.TEXT,
+              Data = text,
+              Position = position,
+              RotationOrScale = scale / 512.0f,
+              Color = color,
+              Alignment = alignment,
+              FontId = "Debug" // Can be changed to another available font if needed
+          };
+
+          return textSprite;
+      }
+
+
+
+      //Draws The Runtime Indicator
+      public List<MySprite> DrawRuntimeUI(Vector2 centerPos, float value, float scale = 1 / 512f)
+      {
+          List<MySprite> frame = new List<MySprite>();
+          frame.Add(new MySprite(SpriteType.TEXTURE, "Screen_LoadingBar", new Vector2(0f, -16f) * scale + centerPos, new Vector2(300f, 300f) * scale, new Color(40, 40, 40, 255), null, TextAlignment.CENTER, value)); // BLANKACTIVEWHEEL
+          //frame.Add(new MySprite(SpriteType.TEXTURE, "Screen_LoadingBar", new Vector2(0f, -16f) * scale + centerPos, new Vector2(400f, 400f) * scale, new Color(40, 40, 40, 255), null, TextAlignment.CENTER, value)); // BLANKACTIVEWHEEL
+          return frame;
+      }
+
+      // Fixed UI For Radar Locking (Whips Tool Was a Lifesaver For Making This)
+      public List<MySprite> DrawFixedUI(Vector2 centerPos, float scale = 1 / 512f)
+      {
+          List<MySprite> frame = new List<MySprite>();
+
+          frame.Add(new MySprite(SpriteType.TEXTURE, "CircleHollow", new Vector2(0f, -16f) * scale + centerPos, new Vector2(400f, 400f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // OuterReticule
+          frame.Add(new MySprite(SpriteType.TEXTURE, "CircleHollow", new Vector2(0f, -16f) * scale + centerPos, new Vector2(396f, 396f) * scale, new Color(0, 0, 0, 255), null, TextAlignment.CENTER, 0f)); // OuterReticuleCover2
+          frame.Add(new MySprite(SpriteType.TEXTURE, "CircleHollow", new Vector2(0f, -16f) * scale + centerPos, new Vector2(240f, 240f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // InnerReticule
+          frame.Add(new MySprite(SpriteType.TEXTURE, "CircleHollow", new Vector2(0f, -16f) * scale + centerPos, new Vector2(234f, 234f) * scale, new Color(0, 0, 0, 255), null, TextAlignment.CENTER, 0f)); // InnerReticuleCover
+          frame.Add(new MySprite(SpriteType.TEXTURE, "Circle", new Vector2(0f, -16f) * scale + centerPos, new Vector2(11f, 11f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // CenterMark
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareSimple", new Vector2(0f, -16f) * scale + centerPos, new Vector2(430f, 1f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // LineHoriz
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareSimple", new Vector2(0f, -16f) * scale + centerPos, new Vector2(1f, 430f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // LineVert
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareHollow", new Vector2(-174f, 200f) * scale + centerPos, new Vector2(130f, 88f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // MissileIndicatorBox
+          frame.Add(new MySprite(SpriteType.TEXT, "x", new Vector2(-199f, 173f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 1.4f * scale)); // Missile X
+          frame.Add(new MySprite(SpriteType.TEXTURE, "DecorativeBracketRight", new Vector2(230f, -13f) * scale + centerPos, new Vector2(31f, 175f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // Decorative Right
+          frame.Add(new MySprite(SpriteType.TEXTURE, "DecorativeBracketLeft", new Vector2(-230f, -13f) * scale + centerPos, new Vector2(31f, 175f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // Decorative Left
+          frame.Add(new MySprite(SpriteType.TEXTURE, "Triangle", new Vector2(-218f, 216f) * scale + centerPos, new Vector2(19f, 29f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // MissileBase
+          frame.Add(new MySprite(SpriteType.TEXTURE, "Circle", new Vector2(-218f, 178f) * scale + centerPos, new Vector2(17f, 19f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // MissileCap
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareSimple", new Vector2(-218f, 198f) * scale + centerPos, new Vector2(17f, 37f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // Missilebody
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareSimple", new Vector2(-218f, 197f) * scale + centerPos, new Vector2(5f, 31f) * scale, new Color(0, 0, 0, 255), null, TextAlignment.CENTER, 0f)); // MissileCore
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareHollow", new Vector2(174f, 200f) * scale + centerPos, new Vector2(130f, 88f) * scale, new Color(255, 255, 255, 255), null, TextAlignment.CENTER, 0f)); // TargTypeBox
+          frame.Add(new MySprite(SpriteType.TEXT, "1.5Km", new Vector2(-17f, 104f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 0.5f * scale)); // visual2.5kmarkCopy
+          frame.Add(new MySprite(SpriteType.TEXT, "2.5Km", new Vector2(-21f, 186f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 0.5f * scale)); // visual2.5kmark
+          frame.Add(new MySprite(SpriteType.TEXT, "RDAV", new Vector2(-153f, 216f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.CENTER, 0.6f * scale)); // RDAV_D
+
+          return frame;
+      }
+
+      public List<MySprite> DrawBoostUI(Vector2 centerPos, float scale = 1 / 512f)
+      {
+          List<MySprite> frame = new List<MySprite>();
+
+          frame.Add(new MySprite(SpriteType.TEXTURE, "Danger", new Vector2(-205f,110f)*scale+centerPos, new Vector2(52f,52f)*scale, new Color(255,255,255,255), null, TextAlignment.CENTER, 0f)); // sprite2
+
+          return frame;
+      }
+      
+      // Fixed UI Lock Indicator
+      public List<MySprite> DrawTargetLockUI(Vector2 centerPos, float scale = 1 / 512f)
+      {
+          List<MySprite> frame = new List<MySprite>();
+
+          frame.Add(new MySprite(SpriteType.TEXTURE, "SquareSimple", new Vector2(0f, 223f) * scale + centerPos, new Vector2(133f, 37f) * scale, new Color(255, 0, 0, 255), null, TextAlignment.CENTER, 0f)); // BLANKTARGLOCK
+          frame.Add(new MySprite(SpriteType.TEXT, "TARGET LOCK", new Vector2(-1f, 211f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.CENTER, 0.7f * scale)); // BLANKTARGETLOCK
+
+          return frame;
+      }
+
+      //Draws The Text Readouts
+      public List<MySprite> DrawDynamicUI(Vector2 centerPos, string MissilesRemaining, string LockType, string Line1, string Line2, float scale = 1 / 512f)
+      {
+          List<MySprite> frame = new List<MySprite>();
+          frame.Add(new MySprite(SpriteType.TEXT, MissilesRemaining, new Vector2(-177f, 172f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 1.6f * scale)); // BLANKMISQTY
+          frame.Add(new MySprite(SpriteType.TEXT, LockType, new Vector2(121f, 158f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 1.4f * scale)); // BLANKRTRACKTYP
+          frame.Add(new MySprite(SpriteType.TEXT, Line1, new Vector2(121f, 211f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 0.6f * scale)); // BLANKGRID
+          frame.Add(new MySprite(SpriteType.TEXT, Line2, new Vector2(121f, 193f) * scale + centerPos, null, new Color(255, 255, 255, 255), "Debug", TextAlignment.LEFT, 0.6f * scale)); // BLANKWEPTYP
+          return frame;
+      }
+
+      //Projecting Code
+      public void ProjectToPlane(MatrixD WorldToLocalSpace, Vector3D Location, Vector3D Velocity, out Vector2 LocationScreenspace, out Vector2 velocityindicatorlocationSceenspace)
+      {
+          const float pixelsPerMeter = 0.5f * 0.16f;
+          const float screenUnitsPerMeter = pixelsPerMeter / 512.0f;
+          Vector2 RadarCenter = new Vector2(0.5f, 0.5f) + new Vector2(0, -16) / 512.0f; //16 pixels up
+
+          // Correct transformation for position (apply translation)
+          Vector3D localPos = Vector3D.Transform(Location, WorldToLocalSpace);
+
+          // Convert to screen space (XY plane)
+          LocationScreenspace = RadarCenter + new Vector2((float)localPos.X, (float)localPos.Z) * screenUnitsPerMeter;
+
+          // Transform velocity correctly as a direction
+          Vector3D localVelocity = Vector3D.TransformNormal(Velocity, WorldToLocalSpace);
+
+          // Create direction marker (small offset)
+          //velocityindicatorlocationSceenspace = LocationScreenspace + new Vector2((float)localVelocity.X, (float)localVelocity.Z) * screenUnitsPerMeter*4;
+          if (localVelocity.LengthSquared() > 0)
+          {
+              localVelocity = Vector3D.Normalize(localVelocity);
+          }
+          velocityindicatorlocationSceenspace = LocationScreenspace + new Vector2((float)localVelocity.X, (float)localVelocity.Z) * 0.05f;
+
+      }
+
+
+
+      float sweepAngle = 0f; // In radians
+      const float SweepSpeed = 0.05f; // Radians per tick
+      const float decorativelinethickness = 0.0025f;
+      int BullshitTimer = 0;
+
+
+      public struct TargetInfo
+      {
+          public Vector3D Location;
+          public Vector3D Velocity;
+          public Color RenderColour;
+      }
+
+      public struct RuntimeAgs
+      {
+          public Vector3D ReferenceLocation;
+          public Vector3D ReferenceForwards;
+          public Vector3D ReferenceUpwards;
+
+          public List<TargetInfo> ToDisplay;
+
+          public string Targetmode;
+          public string Targetinfoline1;
+          public string Targetinfoline2;
+          public int MissileRemainingCount;
+
+          public bool TargetLock;
+          public bool BoostMode;
+      }
+
+
+      public void DrawGUI(RuntimeAgs args)
+      {
+
+          using (MySpriteDrawFrame frame = RenderingSurface.DrawFrame())
+          {
+              //Renderable Sprites
+              List<MySprite> renderableSprites = new List<MySprite>();
+
+              //Renders The Basics
+              renderableSprites.AddRange(DrawRuntimeUI(new Vector2(0.5f, 0.5f), sweepAngle));
+              renderableSprites.AddRange(DrawFixedUI(new Vector2(0.5f, 0.5f)));
+
+              //Generates The Reference Frame
+              MatrixD viewMatrix = MatrixD.CreateWorld(args.ReferenceLocation, args.ReferenceForwards, args.ReferenceUpwards);
+              MatrixD viewInv = MatrixD.Invert(viewMatrix); //world to reference frame
+
+              //Renders All Tracked Points
+              foreach (var item in args.ToDisplay)
+              {
+                  Vector2 Squarelocation, Squarepointpos;
+                  ProjectToPlane(viewInv, item.Location, item.Velocity, out Squarelocation, out Squarepointpos);
+                  renderableSprites.Add(DrawRectangle_FromCntr(Squarelocation, 0.025f, 0.025f, item.RenderColour, true));
+                  renderableSprites.Add(DrawLine(Squarelocation, Squarepointpos, 0.005f, item.RenderColour));
+                  renderableSprites.Add(DrawText(item.Velocity.Length().ToString("F1"), Squarelocation + new Vector2(0.02f, -0.04f), item.RenderColour, 0.5f, TextAlignment.LEFT));
+              }
+
+              //Renders Information GUI
+              renderableSprites.AddRange(DrawDynamicUI(new Vector2(0.5f, 0.5f), args.MissileRemainingCount.ToString("D2"), args.Targetmode, args.Targetinfoline1, args.Targetinfoline2));
+
+              //Renders Target Lock Notification (If applicable)
+              if (args.TargetLock)
+              {
+                  renderableSprites.AddRange(DrawTargetLockUI(new Vector2(0.5f, 0.5f)));
+              }
+
+              if (args.BoostMode)
+              {
+                  renderableSprites.AddRange(DrawBoostUI(new Vector2(0.5f, 0.5f)));
+              }
+
+              //-----------------------------------------------------------
+
+              //Translates All The Sprites Into Surface Space (could do this with a matrix but I'm lazy)
+              //Random Random = new Random();
+              //float ThisPainInTheAss = (float)Random.NextDouble();
+              for (int i = 0; i < renderableSprites.Count; i++)
+              {
+                  MySprite sprite = renderableSprites[i];
+
+                  // Convert normalized position and size to surface pixel space
+                  sprite.Position = sprite.Position * SurfaceScaleToScreenSpace + SurfOffsetToScreenSpace;
+                  sprite.Size *= SurfaceScaleToScreenSpace;
+
+                  //Scales Text Only
+                  if (sprite.Type == SpriteType.TEXT)
+                  { sprite.RotationOrScale *= SurfaceScaleToScreenSpace.X; }
+
+                  //No Longer Required
+                  //sprite.Position += new Vector2(ThisPainInTheAss*0.01f);
+
+                  //Replace updated sprite back into list
+                  renderableSprites[i] = sprite;
+              }
+
+              //Adds Empty Sprite
+              if (BullshitTimer > 20)
+              {
+                  frame.Add(new MySprite());
+                  BullshitTimer = 0;
+              }
+              BullshitTimer++;
+
+              //Adds Them And Renders
+              frame.AddRange(renderableSprites);
+
+              //---------------------------------------------------------
+
+              // Increment angle for runtiome indicator
+              sweepAngle += SweepSpeed;
+              if (sweepAngle >= MathHelper.TwoPi) sweepAngle -= MathHelper.TwoPi;
+          }
+      }
+
+  }
+  #endregion
+
+  //Missile Class And Guidance
+  #region Missile Management Module
+  class MISSILE
+  {
+
+      //Root Of The Missile
+      public IMyShipMergeBlock MERGE;
+
+      //Critical Missile Blocks
+      public IMyGyro GYRO;
+      public List<IMyThrust> THRUSTERS = new List<IMyThrust>();
+
+      //Optional Missile Blocks
+      public List<IMyTimerBlock> TIMER = new List<IMyTimerBlock>(); //this is used for any player made logic
+      public List<IMyBatteryBlock> POWER = new List<IMyBatteryBlock>();
+      public List<IMyWarhead> WARHEADS = new List<IMyWarhead>(); //Multiple
+      public List<IMyGasTank> TANKS = new List<IMyGasTank>(); //Gas tank
+      public List<IMyShipConnector> CONNECTOR = new List<IMyShipConnector>();
+      public List<IMySoundBlock> SOUND = new List<IMySoundBlock>();
+
+      //Guidance Variables
+      public Vector3D TARGET_PREV_POS = new Vector3D();
+      public Vector3D MIS_PREV_POS = new Vector3D();
+      public double PREV_Yaw = 0; //for PID
+      public double PREV_Pitch = 0; //for PID
+
+      //Constant Variables
+      const double Global_Timestep = 0.016;
+      const double PNGain = 4;
+
+      //Launch Variables
+      public int LaunchTimer = 0;
+      public bool ThrustersIgnited = false;
+      public bool ReadyAndActive = false;
+
+      //----------------------
+
+      //Setup Variables
+      List<IMyTerminalBlock> GridViewAtLaunch; //a view of the entire grid at launch
+      public double MissileMass = 0;
+      public double MissileThrust = 0;
+      public double MissileAccel = 10;
+
+      //Boots Missile
+      public MISSILE(IMyShipMergeBlock mergeBlock, List<IMyTerminalBlock> gridViewAtLaunch)
+      {
+          //LaunchPlatformCubeGrid = (IMyCubeGrid)mergeBlock.CubeGrid;
+          MERGE = mergeBlock;
+          GridViewAtLaunch = gridViewAtLaunch;
+          MERGE.Enabled = false;
+      }
+
+      //Trims Not Connected, run once per missile
+      public void SETUP_TrimBlocksOnMissileGrid()
+      {
+          // Remove all blocks not on the same grid
+          IMyCubeGrid localGrid = (IMyCubeGrid)MERGE.CubeGrid; // Get the grid of the programmable block
+          GridViewAtLaunch.RemoveAll(block => block.CubeGrid != localGrid);
+      }
+
+      //Assigns Missile Blocks, run once per missile
+      public void SETUP_AssignBlocksToMissile()
+      {
+          //Iterates Through Grid, If Any Not Found Then Cycle Back And Say Whattttt
+          foreach (var item in GridViewAtLaunch)
+          {
+              if (item is IMyGyro && GYRO == null)
+              { GYRO = item as IMyGyro; }
+              else if (item is IMyThrust)
+              {THRUSTERS.Add(item as IMyThrust);}
+              else if (item is IMyTimerBlock)
+              {TIMER.Add(item as IMyTimerBlock);}
+              else if (item is IMyBatteryBlock)
+              { POWER.Add(item as IMyBatteryBlock); }
+              else if (item is IMyWarhead)
+              {WARHEADS.Add(item as IMyWarhead); }
+              else if (item is IMyGasTank)
+              {TANKS.Add(item as IMyGasTank);}
+              else if (item is IMyShipConnector)
+              { CONNECTOR.Add(item as IMyShipConnector); }
+              else if (item is IMySoundBlock)
+              { SOUND.Add(item as IMySoundBlock); }
+          }
+      }
+
+      //Removes Thrusters Not In Dominant Axis
+      public void SETUP_RemoveThrustNotInDominantAxis()
+      {
+          Dictionary<Vector3D, double> thrustDict = new Dictionary<Vector3D, double>();
+
+          //Runs Loop To Determine Dominant Direction
+          foreach (var thruster in THRUSTERS)
+          {
+              Vector3D forward = thruster.WorldMatrix.Forward;
+              double thrustValue = thruster.MaxEffectiveThrust;
+
+              if (!thrustDict.ContainsKey(forward))
+                  thrustDict[forward] = thrustValue;
+              else
+                  thrustDict[forward] += thrustValue;
+          }
+
+          //Safety
+          if (thrustDict.Count == 0)
+          {
+              THRUSTERS = new List<IMyThrust>();
+              return;
+          }
+
+          //Runs
+          Vector3D dominantDirection = thrustDict.OrderByDescending(kv => kv.Value).First().Key;
+          THRUSTERS = THRUSTERS.Where(t => t.WorldMatrix.Forward == dominantDirection).ToList();
+      }
+
+      //Assigns Default Behaviour, run once per missile
+      public void SETUP_AssignDefaultBlockBehaviourAndAccel()
+      {
+          // Turn on all blocks in the list
+          foreach (var block in GridViewAtLaunch)
+          {
+              var functional = block as IMyFunctionalBlock;
+              if (functional != null)
+              {
+                  functional.Enabled = true;
+              }
+
+              // Adds Mass
+              MissileMass += block.Mass;
+          }
+
+          //Merge Disable
+          MERGE.Enabled = false;
+
+          // Set batteries to discharge
+          foreach (var battery in POWER)
+          {
+              battery.ChargeMode = ChargeMode.Discharge;
+          }
+
+          // Set gas tanks to not stockpile
+          foreach (var tank in TANKS)
+          {
+              tank.Stockpile = false;
+          }
+
+          // Set warheads to safe (not armed)
+          foreach (var warhead in WARHEADS)
+          {
+              warhead.IsArmed = false;
+          }
+
+          // Trigger all timer blocks immediately
+          foreach (var timer in TIMER)
+          {
+              timer.Trigger();
+          }
+
+          // Gathers all thruster (power only)
+          foreach (var thruster in THRUSTERS)
+          {
+              //Adds Force Component (Forwards Only)
+              double ThisThrusterThrust = thruster.MaxThrust;
+              MissileThrust += ThisThrusterThrust;
+          }
+
+          // Set connectors to unlock and disable
+          foreach (var connector in CONNECTOR)
+          {
+              connector.Disconnect(); // Unlocks if connected
+              connector.Enabled = false; // Turns off the connector
+          }
+
+          //Sets Acceleration
+          MissileAccel = MissileThrust / MissileMass;
+
+      }
+
+      //Assigns Thrusters To Go (Seperate Action Govered By Gravity Drop)
+      public void SETUP_ActivateThrusters()
+      {
+          // Set all thrusters to max override
+          foreach (var thruster in THRUSTERS)
+          {
+              thruster.ThrustOverridePercentage = 1f; // 100% power
+          }
+          ThrustersIgnited = true;
+      }
+
+      //This Is Primary Setup Runtime
+      public void InitialiseAfterDetach()
+      {
+          SETUP_TrimBlocksOnMissileGrid();
+          SETUP_AssignBlocksToMissile();
+          SETUP_RemoveThrustNotInDominantAxis();
+          SETUP_AssignDefaultBlockBehaviourAndAccel();
+
+          //Enables Missile
+          ReadyAndActive = true;
+      }
+
+
+      //---------------------
+
+      //Guides Missile Using Pronav To A Location
+      public void PerFrame_RunGuidance(Vector3D ENEMY_POS, Vector3D GravityDirectionAndMagnitude)
+      {
+          //Has Not Detached Yet
+          if (MERGE.IsSameConstructAs(Program_local.Me))
+          {
+              return;
+          }
+
+          //Has Now Detached Ensure Has Initialized
+          if (!ReadyAndActive)
+          {
+              InitialiseAfterDetach();
+              return;
+          }
+
+          //Runs Standard Launch Timer Operations
+          LaunchTimer++;
+
+          if (LaunchTimer > IGNITEDELAY && !ThrustersIgnited)
+          {
+              SETUP_ActivateThrusters();
+          }
+
+          //Triggers Only If Clear Of Launch Platform (In Guidance Time)
+          if (LaunchTimer < GUIDEDELAY)
+          {
+              return;
+          }
+
+
+          //---------------------------------------------------------------------------------------------------------------------------------
+
+          //Sorts CurrentVelocities
+          Vector3D MissilePosition = GYRO.CubeGrid.WorldVolume.Center;
+          Vector3D MissilePositionPrev = MIS_PREV_POS;
+          Vector3D MissileVelocity = (MissilePosition - MissilePositionPrev) / Global_Timestep;
+
+          Vector3D TargetPosition = ENEMY_POS;
+          Vector3D TargetPositionPrev = TARGET_PREV_POS;
+          Vector3D TargetVelocity = (TargetPosition - TARGET_PREV_POS) / Global_Timestep;
+
+          //Uses RdavNav Navigation APN Guidance System
+          //-----------------------------------------------
+
+          //Setup LOS rates and PN system
+          Vector3D LOS_Old = Vector3D.Normalize(TargetPositionPrev - MissilePositionPrev);
+          Vector3D LOS_New = Vector3D.Normalize(TargetPosition - MissilePosition);
+          Vector3D Rel_Vel = Vector3D.Normalize(TargetVelocity - MissileVelocity);
+
+          //And Assigners
+          Vector3D am = new Vector3D(1, 0, 0); double LOS_Rate; Vector3D LOS_Delta;
+          Vector3D MissileForwards = THRUSTERS[0].WorldMatrix.Backward;
+
+          //Vector/Rotation Rates
+          if (LOS_Old.Length() == 0)
+          { LOS_Delta = new Vector3D(0, 0, 0); LOS_Rate = 0.0; }
+          else
+          { LOS_Delta = LOS_New - LOS_Old; LOS_Rate = LOS_Delta.Length() / Global_Timestep; }
+
+          //-----------------------------------------------
+
+          //Closing TargetVelocity
+          double Vclosing = (TargetVelocity - MissileVelocity).Length();
+
+
+          //Calculate the final lateral acceleration
+          Vector3D LateralDirection = Vector3D.Normalize(Vector3D.Cross(Vector3D.Cross(Rel_Vel, LOS_New), Rel_Vel));
+          Vector3D LateralAccelerationComponent = LateralDirection * PNGain * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * PNGain); //Eases Onto Target Collision LOS_Delta * 9.8 * (0.5 * Gain)
+
+          //If Impossible Solution (ie maxes turn rate) Use Drift Cancelling For Minimum T
+          double OversteerReqt = (LateralAccelerationComponent).Length() / MissileAccel;
+          if (OversteerReqt > 0.98)
+          {
+              LateralAccelerationComponent = MissileAccel * Vector3D.Normalize(LateralAccelerationComponent + (OversteerReqt * Vector3D.Normalize(-MissileVelocity)) * 40);
+          }
+
+          //Calculates And Applies Thrust In Correct Direction (Performs own inequality check)
+          double ThrustPower = Vector_Projection_Scalar(MissileForwards, Vector3D.Normalize(LateralAccelerationComponent)); //TESTTESTTEST
+          ThrustPower = MathHelper.Clamp(ThrustPower, 0.5, 1); //for improved thrust performance on the get-go
+
+          //Large grid needs no finesse, power is always limited
+          if (MERGE.CubeGrid.GridSizeEnum == MyCubeSize.Large )
+          { ThrustPower = 1;}
+
+          foreach (IMyThrust thruster in THRUSTERS)
+          {
+              if (thruster.ThrustOverride != (thruster.MaxThrust * ThrustPower)) //12 increment inequality to help conserve on performance
+              { thruster.ThrustOverride = (float)(thruster.MaxThrust * ThrustPower); }
+          }
+
+          //Calculates Remaining Force Component And Adds Along LOS
+          double RejectedAccel = Math.Sqrt(MissileAccel * MissileAccel - LateralAccelerationComponent.LengthSquared()); //Accel has to be determined whichever way you slice it
+          if (double.IsNaN(RejectedAccel)) { RejectedAccel = 0; }
+          LateralAccelerationComponent = LateralAccelerationComponent + LOS_New * RejectedAccel;
+
+          //-----------------------------------------------
+
+          //Guides To Target Using Gyros
+          am = Vector3D.Normalize(LateralAccelerationComponent - GravityDirectionAndMagnitude * GravityAggressiveness); 
+          double Yaw; double Pitch;
+          GyroTurn6(am, 18, 0.3, THRUSTERS[0], GYRO as IMyGyro, PREV_Yaw, PREV_Pitch, out Pitch, out Yaw);
+
+          //Updates For Next Tick Round
+          TARGET_PREV_POS = TargetPosition;
+          MIS_PREV_POS = MissilePosition;
+          PREV_Yaw = Yaw;
+          PREV_Pitch = Pitch;
+
+          //Detonates warheads in close proximity
+          if ((TargetPosition - MissilePosition).LengthSquared() < (FuseDistance + 20) * (FuseDistance + 20) && WARHEADS.Count > 0) //Arms
+          { foreach (var item in WARHEADS) { (item as IMyWarhead).IsArmed = true; } }
+          if ((TargetPosition - MissilePosition).LengthSquared() < FuseDistance * FuseDistance && WARHEADS.Count > 0) //A mighty earth shattering kaboom
+          { (WARHEADS[0] as IMyWarhead).Detonate(); }
+
+      }
+
+      //Use For Magnitudes Of Vectors In Directions (0-IN.length)
+      public static double Vector_Projection_Scalar(Vector3D IN, Vector3D Axis_norm)
+      {
+          double OUT = 0;
+          OUT = Vector3D.Dot(IN, Axis_norm);
+          if (OUT == double.NaN)
+          { OUT = 0; }
+          return OUT;
+      }
+
+      //Controls Gyro Guidane (An Rdav tried and true classic I don't really want to touch this)
+      void GyroTurn6(Vector3D TARGETVECTOR, double GAIN, double DAMPINGGAIN, IMyTerminalBlock REF, IMyGyro GYRO, double YawPrev, double PitchPrev, out double NewPitch, out double NewYaw)
+      {
+          //Pre Setting Factors
+          NewYaw = 0;
+          NewPitch = 0;
+
+          //Retrieving Forwards And Up
+          Vector3D ShipUp = REF.WorldMatrix.Up;
+          Vector3D ShipForward = REF.WorldMatrix.Backward; //Backward for thrusters
+
+          //Create And Use Inverse Quatinion                   
+          Quaternion Quat_Two = Quaternion.CreateFromForwardUp(ShipForward, ShipUp);
+          var InvQuat = Quaternion.Inverse(Quat_Two);
+
+          Vector3D DirectionVector = TARGETVECTOR; //RealWorld Target Vector
+          Vector3D RCReferenceFrameVector = Vector3D.Transform(DirectionVector, InvQuat); //Target Vector In Terms Of RC Block
+
+          //Convert To Local Azimuth And Elevation
+          double ShipForwardAzimuth = 0; double ShipForwardElevation = 0;
+          Vector3D.GetAzimuthAndElevation(RCReferenceFrameVector, out ShipForwardAzimuth, out ShipForwardElevation);
+
+          //Post Setting Factors
+          NewYaw = ShipForwardAzimuth;
+          NewPitch = ShipForwardElevation;
+
+          //Applies Some PID Damping
+          ShipForwardAzimuth = ShipForwardAzimuth + DAMPINGGAIN * ((ShipForwardAzimuth - YawPrev) / Global_Timestep);
+          ShipForwardElevation = ShipForwardElevation + DAMPINGGAIN * ((ShipForwardElevation - PitchPrev) / Global_Timestep);
+
+          //Does Some Rotations To Provide For any Gyro-Orientation
+          var REF_Matrix = MatrixD.CreateWorld(REF.GetPosition(), (Vector3)ShipForward, (Vector3)ShipUp).GetOrientation();
+          var Vector = Vector3.Transform((new Vector3D(ShipForwardElevation, ShipForwardAzimuth, 0)), REF_Matrix); //Converts To World
+          var TRANS_VECT = Vector3.Transform(Vector, Matrix.Transpose(GYRO.WorldMatrix.GetOrientation()));  //Converts To Gyro Local
+
+          //Logic Checks for NaN's
+          if (double.IsNaN(TRANS_VECT.X) || double.IsNaN(TRANS_VECT.Y) || double.IsNaN(TRANS_VECT.Z))
+          { return; }
+
+          //Applies To Scenario
+          GYRO.Pitch = (float)MathHelper.Clamp((-TRANS_VECT.X) * GAIN, -1000, 1000);
+          GYRO.Yaw = (float)MathHelper.Clamp(((-TRANS_VECT.Y)) * GAIN, -1000, 1000);
+          GYRO.Roll = (float)MathHelper.Clamp(((-TRANS_VECT.Z)) * GAIN, -1000, 1000);
+          GYRO.GyroOverride = true;
+      }
+
+      //---------------------
+
+      //Gets Missile Position
+      public Vector3D WorldLocation
+      {
+          get
+          {
+              if (GYRO != null)
+              {
+                  return GYRO.GetPosition();
+              }
+              return new Vector3D(0, 0, 0);
+          }
+      }
+
+      //Gets Missile Velocity
+      public Vector3D WorldVelocity
+      {
+          get
+          {
+              if (LaunchTimer < GUIDEDELAY)
+              {
+                  return new Vector3D(0, 0, 0);
+              }
+
+              if (GYRO != null)
+              {
+                  return GYRO.GetPosition() - MIS_PREV_POS;
+              }
+
+              return new Vector3D(0, 0, 0);               
+          }
+      }
+
+      //Gets Missile Status
+      public bool RequiresDispose()
+      {
+          //Safety Only Dispose Once Initialized
+          if (!ReadyAndActive)
+          {
+              return false;
+          }
+
+          //Initial Check
+          if (GYRO == null || THRUSTERS.Count < 1)
+          {
+              return true;
+          }
+
+          //Checks Status
+          bool Isgyroout = GYRO.CubeGrid.GetCubeBlock(GYRO.Position) == null;
+          bool Isthrusterout = THRUSTERS[0].CubeGrid.GetCubeBlock(THRUSTERS[0].Position) == null;
+          if (Isgyroout || Isthrusterout)
+          { return true; }
+          return false;
+      }
+
+  }
+  #endregion
+
+  //---
+
+  //Initialiser
+  #region Setup Stages
+  Program()
+  {
+      //ifdebug
+      //debug = new DebugAPI(this);
+
+      //Sets Runtime
+      Runtime.UpdateFrequency = UpdateFrequency.Update1;
+
+      //Setup String
+      string SetupString = "Rdavs Guided Missile Script Basic Setup \n================================================== \n \n \nSystem Setup \n=================== \n \nTo Set Up The Ship: \n------------------------ \n- Put this Code Into a P-block \n- Install a light block (optional) \n- Install an Offensive combat block & Flight Block called #A#  \n- Recompile if prompted to 'reset' \n- To fire from the toolbar 'run' this Pb with \n  the argument 'Fire'";
+      Me.CustomData = SetupString;
+
+      if (OnlyUseBlocksOnSameConstruct)
+      {
+
+      }
+
+      //Collects RC Unit (Prefers Main Cockpit)
+      List<IMyTerminalBlock> TempCollection3 = new List<IMyTerminalBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyShipController>(TempCollection3, a => a.DetailedInfo != "NoUse" && (!OnlyUseBlocksOnSameConstruct || a.IsSameConstructAs(Me)));
+      if (TempCollection3.Count > 0)
+      {
+          IMyShipController mainCockpit = TempCollection3
+              .Cast<IMyShipController>()
+              .FirstOrDefault(controller => controller.IsMainCockpit);
+
+          RC = mainCockpit ?? TempCollection3[0] as IMyShipController;
+          if (RenameCockpit)
+          { RC.CustomName = "Cockpit, RD Missile Guidance";}
+
+      }
+      //if (TempCollection3.Count > 0)
+      //{ RC = TempCollection3[0] as IMyShipController; RC.CustomName = "Cockpit, RD Missile Guidance"; }
+
+      //Collects First Turret
+      List<IMyFlightMovementBlock> TempCollection = new List<IMyFlightMovementBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyFlightMovementBlock>(TempCollection, a => a.CustomName.Contains(MissileTag) && a.DetailedInfo != "NoUse" && (!OnlyUseBlocksOnSameConstruct || a.IsSameConstructAs(Me)));
+      List<IMyOffensiveCombatBlock> TempCollection01 = new List<IMyOffensiveCombatBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyOffensiveCombatBlock>(TempCollection01, a => a.CustomName.Contains(MissileTag) && a.DetailedInfo != "NoUse" && (!OnlyUseBlocksOnSameConstruct || a.IsSameConstructAs(Me)));
+      if (TempCollection.Count > 0 && TempCollection01.Count > 0)
+      {
+
+          // Find relevant blocks on the grid (you can replace with specific names or tags)
+          IMyFlightMovementBlock flightBlock = TempCollection[0];
+          IMyOffensiveCombatBlock combatBlock = TempCollection01[0];
+          ThisTracker = new RadarTrackingModule(flightBlock, combatBlock);
+      }
+
+      //Collects LCD Fro Display
+      // Try to find an LCD panel with the tag
+      var lcds = new List<IMyTextPanel>();
+      GridTerminalSystem.GetBlocksOfType<IMyTextPanel>(lcds, a => a.CustomName.Contains(MissileTag) && (!OnlyUseBlocksOnSameConstruct || a.IsSameConstructAs(Me)));
+      if (lcds.Count>0)
+      {
+          GUIPanel = new TrackingDisplay(lcds[0]);
+      }
+      else if (RC!=null && RC is IMyCockpit)
+      {
+          GUIPanel = new TrackingDisplay((RC as IMyCockpit).GetSurface(MissileLCD));
+      }
+
+      //Collects Light/Alarm
+      List<IMyTerminalBlock> TempCollection2 = new List<IMyTerminalBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyLightingBlock>(TempCollection2, a => a.CustomName.Contains(MissileTag) && (!OnlyUseBlocksOnSameConstruct || a.IsSameConstructAs(Me)));
+      if (TempCollection2.Count > 0)
+      {
+          Alarm = TempCollection2[0] as IMyLightingBlock;
+      }
+
+
+  }
+  #endregion
+
+  //Main Method
+  #region Main Method
+  void Main(string argument)
+  {
+      //Ifdebug
+      //debug.RemoveDraw();
+      Program_local = this;
+
+      //General Layout Diagnostics
+      OP_BAR();
+      Echo("Active (Fired) Missiles: " + MISSILES.Count);
+      Echo("Runtime: " + Runtime.LastRunTimeMs.ToString("F2"));
+      Echo("Version:  " + VERSION);
+      Echo("\nInfo:\n---------------");
+      Echo(Lstrundata);
+
+      //--------------------------------------
+
+      #region Block Error Readouts
+
+      //Core Block Checks
+      if (RC == null || RC.CubeGrid.GetCubeBlock(RC.Position) == null)
+      { Echo(" ~ No Ship Control Found,\nInstall Forward Facing Cockpit/RC/Flightseat And Press Recompile"); RC = null; return; }
+      if (ThisTracker == null)
+      { Echo("No Target Tracking System Found\n> Make sure a combat AI block and flight AI block are installed and both have '#A#' in the name\n> Then press Recompile."); return; }
+      if (GUIPanel == null)
+      { Echo("No GUI Display Found\n> Install an LCD or cockpit screen with name containing the MissileTag \n> Then press Recompile."); return; }
+      if (Alarm == null || Alarm.CubeGrid.GetCubeBlock(Alarm.Position) == null)
+      { Echo(" ~ No Target Indicator Light Found,\nInstall Light Block With Missile Tag In Name And Press Recompile\n (script will work fine without) "); Alarm = null; }
+      Lstrundata = "All Systems Active\nAwaiting Target";
+      #endregion
+
+      //--------------------------------------
+
+      //Updates Tracking System
+      ThisTracker.UpdateTracking(Runtime.LifetimeTicks); //DateTime.Now.Ticks
+
+      //Toggles LockOn
+      bool HasTarget = ThisTracker.IsTracking; //If Turret Detects Enemy
+
+      //Updates Track Location
+      if (HasTarget)
+      {
+          TrackedTargetLocation = ThisTracker.TargetPosition;
+          TrackedTargetVelocity = ThisTracker.TargetVelocity;
+          Lstrundata = "TARGET LOCKED\n" + ThisTracker.TrackedObjectName;
+          Lstrundata += "\nBoost: " + ThisTracker.BoostMode;
+          //Ifdebug
+          //BoundingSphere spher = new BoundingSphere(TrackedTargetLocation, 2.5f);
+          //debug.DrawSphere(spher, Color.SkyBlue, DebugAPI.Style.Wireframe);
+
+          //Simple Auto Launch Logic
+          AutoLaunchTimer++;
+          if (AutoLaunchTimer > TicksBetweenAutoLaunch && EnableAutoLaunch)
+          { argument = "Fire"; AutoLaunchTimer = 0; }
+      }
+      else
+      {
+          //Puts Some Far Away Values
+          TrackedTargetLocation = RC.WorldMatrix.Forward * 9000 + RC.GetPosition();
+          TrackedTargetVelocity = new Vector3D();
+      }
+
+      //Turns Indiator Light On/Off
+      if (Alarm != null)
+      {
+          if (HasTarget)
+          {
+              Alarm.Color = Color.Red;
+          }
+          else
+          {
+              Alarm.Color = Color.Green;
+          }
+      }
+
+      //Periodically Searches For New Missile Merge Blocks And Connectors (auto connects connectors)
+      if (MergeSearchRefreshTimer > 120)
+      {
+          List<IMyTerminalBlock> MERGES = new List<IMyTerminalBlock>();
+          GridTerminalSystem.GetBlocksOfType<IMyShipMergeBlock>(MERGES, b => b.CustomName.Contains(MissileTag));
+          MissileRemainingCount = MERGES.Count();
+
+
+          //Automatically Connects Connectors
+          if (Autoconnect)
+          {
+              List<IMyTerminalBlock> CONNECTORS = new List<IMyTerminalBlock>();
+              GridTerminalSystem.GetBlocksOfType<IMyShipConnector>(CONNECTORS, b => b.CustomName.Contains(MissileTag));
+              foreach (IMyShipConnector item in CONNECTORS)
+              { item.Connect(); }
+          }
+
+          MergeSearchRefreshTimer = 0;
+      }
+      MergeSearchRefreshTimer++;
+
+      //----------------------------------------------------------
+
+      //Updates The UI
+      TrackingDisplay.RuntimeAgs runtimeAgs = new TrackingDisplay.RuntimeAgs();
+      runtimeAgs.ReferenceLocation = RC.GetPosition();
+      runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
+      runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
+      runtimeAgs.TargetLock = HasTarget;
+      runtimeAgs.Targetmode = "RDAR";
+      runtimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();
+      runtimeAgs.Targetinfoline2 = ThisTracker.GetLine2Info();
+      runtimeAgs.MissileRemainingCount = MissileRemainingCount;
+      runtimeAgs.ToDisplay = new List<TrackingDisplay.TargetInfo>();
+      runtimeAgs.BoostMode = ThisTracker.BoostMode;
+
+      //Adds All active Missiles
+      foreach (var missile in MISSILES)
+      {
+          if (missile.ReadyAndActive && missile.ThrustersIgnited)
+          {
+              TrackingDisplay.TargetInfo targetInfo = new TrackingDisplay.TargetInfo();
+              targetInfo.RenderColour = Color.RoyalBlue;
+              targetInfo.Location = missile.WorldLocation;
+              targetInfo.Velocity = missile.WorldVelocity*30;
+
+              runtimeAgs.ToDisplay.Add(targetInfo);
+          }
+      }
+
+      //Adds Target (If Tracking)
+      if (HasTarget)
+      {
+          TrackingDisplay.TargetInfo targetInfo = new TrackingDisplay.TargetInfo();
+          targetInfo.RenderColour = Color.Red;
+          targetInfo.Location = TrackedTargetLocation;
+          targetInfo.Velocity = TrackedTargetVelocity*30;
+
+          runtimeAgs.ToDisplay.Add(targetInfo);
+      }
+
+      GUIPanel.DrawGUI(runtimeAgs);
+
+
+      //Begins Launch Scheduler
+      //-----------------------------------------
+      if (argument == "Fire" )
+      {
+          INIT_NEXT_MISSILE();
+      }
+      if (argument == "Boost")
+      {
+          ThisTracker.BoostMode = !ThisTracker.BoostMode;
+      }
+      if (argument != "Fire" && argument != "Boost" && argument != "")
+      {
+          Lstrundata = "Unknown/Incorrect launch argument,\ncheck spelling & caps,\nto launch argument should be just: Fire\nOr: Boost ";
+      }
+
+      //Runs Guidance Block (foreach missile)
+      //---------------------------------------
+      for (int i = 0; i < MISSILES.Count; i++)
+      {
+          //Runs Guidance
+          var ThisMissile = MISSILES[i];
+
+          //If No Target Switch Targ Position To Use Beam Riding
+          if (!HasTarget)
+          { TrackedTargetLocation = RC.GetPosition() + RC.WorldMatrix.Forward * ((ThisMissile.WorldLocation - Me.GetPosition()).Length() + 300); }
+
+          ThisMissile.PerFrame_RunGuidance(TrackedTargetLocation, RC.GetNaturalGravity());
+
+          //Disposes If Out Of Range Or Destroyed (misses a beat on one missile)
+          if (ThisMissile.RequiresDispose())
+          { MISSILES.Remove(ThisMissile); }
+
+      }
+
+  }
+
+
+  #endregion
+
+  //Finds First Missile Available
+  #region Find Next Missile #RFC#
+  /*=================================================                           
+  Function: RFC Function bar #RFC#                  
+  ---------------------------------------     */
+  bool INIT_NEXT_MISSILE()
+  {
+
+      //Runs Off Merge Block
+      List<IMyTerminalBlock> MERGES = new List<IMyTerminalBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyShipMergeBlock>(MERGES, b => b.CustomName.Contains(MissileTag));
+      MissileRemainingCount = MERGES.Count - 1;
+
+      //Optional Launch Ordering
+      if (OrderedLaunching)
+      {
+          MERGES.SortNoAlloc((a, b) => a.CustomName.CompareTo(b.CustomName));
+      }
+
+      List<IMyTerminalBlock> MissileView = new List<IMyTerminalBlock>();
+      GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(MissileView, b => b.CustomName.Contains(MissileTag));
+
+      //Checks Presence Of Blocks
+      if (MERGES.Count < 1)
+      {
+          Lstrundata = "Last Missile Failed To Fire\nReason:" +
+              "No Missiles Found ";
+              //"\nHas Gyro: True" +
+              ////"\nHas Turret: " + HasTurret +
+              //"\nHas Power: " + HasPower +
+              //"\nHasMerge: " + HasMerge +
+              //"\nHasThruster: " + HasThruster;
+          return false;
+      }
+      else
+      {
+          MISSILES.Add(new MISSILE(MERGES[0] as IMyShipMergeBlock, MissileView));
+          return true;
+      }
+  }
+  #endregion
+
+  //Utils
+  #region RFC Function bar #RFC#
+  string LeftPad = "   ";
+  string Scriptname = "Rdav G3 Missile Nav";
+  /*=================================================                           
+Function: RFC Function bar #RFC#                  
+---------------------------------------     */
+  string[] FUNCTION_BAR = new string[] { "", " ===||===", " ==|==|==", " =|====|=", " |======|", "  ======" };
+  int FUNCTION_TIMER = 0;                                     //For Runtime Indicator
+  void OP_BAR()
+  {
+      FUNCTION_TIMER++;
+      Echo(LeftPad + "~ " + Scriptname + " ~  \n               " + FUNCTION_BAR[FUNCTION_TIMER] + "");
+      if (FUNCTION_TIMER == 5) { FUNCTION_TIMER = 0; }
+  }
+  #endregion

@@ -78,13 +78,13 @@ namespace IngameScript
         const double WAYPOINT_THRESHOLD = 550.0;
         const double DETONATION_DISTANCE = 8.0;
         const float tickTime = 1f / 60f;
-        double _navConstant = 5.0;
+        double _navConstant = 4.0;
         bool isTopdown = false;
         List<Vector3D> _waypoints = new List<Vector3D>();
         List<IMyGyro> _gyros = new List<IMyGyro>();
         List<IMyThrust> _thrusters = new List<IMyThrust>();
         IMyRemoteControl _remoteControl;
-        IMyTextSurface lcdMain;
+        IMyTextPanel lcdMain;
         List<IMyWarhead> _warheads = new List<IMyWarhead>();
         IMyShipMergeBlock _mergeBlock;
         IMySensorBlock _sensor;
@@ -92,6 +92,7 @@ namespace IngameScript
         bool _isStarted = false;
         bool _isInitialized = false;
         bool _antiairmode = false;
+        bool _blocksFullyInitialized = false;
         Vector3D _previousTargetVelocity = Vector3D.Zero;
         Vector3D _previousTargetPoS = Vector3D.Zero;
         Vector3D targetvelocity = Vector3D.Zero;
@@ -215,8 +216,29 @@ namespace IngameScript
                         _remoteControl = GridTerminalSystem.GetBlockWithName("Remote Control Missile") as IMyRemoteControl;
                         if (armtype != "bomb")
                         {
-                            lcdMain = GridTerminalSystem.GetBlockWithName("Holo LCD") as IMyTextSurface;
+                            lcdMain = GridTerminalSystem.GetBlockWithName("Holo LCD") as IMyTextPanel;
+                            if (lcdMain != null)
+                                Echo("[LCD] Holo LCD found and initialized");
+                            else
+                                Echo("[ERROR] Holo LCD not found!");
                         }
+
+                        // Initialize critical blocks once during startup
+                        _sensor = GridTerminalSystem.GetBlockWithName("Sensor") as IMySensorBlock;
+                        if (_sensor != null) _sensor.Enabled = true;
+
+                        if (armtype != "bomb")
+                        {
+                            radar = GridTerminalSystem.GetBlockWithName("Radar") as IMyLargeGatlingTurret;
+                        }
+
+                        // Initialize warheads
+                        GridTerminalSystem.GetBlocksOfType(_warheads);
+
+                        // Initialize gyros
+                        GridTerminalSystem.GetBlocksOfType(_gyros);
+
+                        _blocksFullyInitialized = true;
 
                         //soundblock = GridTerminalSystem.GetBlockWithName("pain") as IMySoundBlock;
                         //soundblock.SelectedSound = "Christ";
@@ -262,9 +284,9 @@ namespace IngameScript
                         }
 
                     }
-                    if (_ticks > 15)
+                    if (_ticks > 15 && _ticks < 30)
                     {
-                        GridTerminalSystem.GetBlocksOfType(_gyros);
+                        // Initial orientation during early startup
                         Vector3D vector_to_target = targetPosition - _remoteControl.GetPosition();
                         Vector3D forward_direction = Vector3D.Normalize(vector_to_target);
                         Vector3D up_vector = -_remoteControl.GetTotalGravity();
@@ -273,24 +295,35 @@ namespace IngameScript
                         // Add the vectors
                         Vector3D combined_direction = forward_direction + (up_vector * uplift_strength);
                         ApplyGyroOverride(combined_direction, _gyros, _remoteControl.WorldMatrix, 0, 0);
-                        GridTerminalSystem.GetBlocks(blocks);
 
-                        foreach (var block in blocks)
+                        // Enable all blocks once during initialization
+                        if (_ticks == 16)
                         {
-                            var functional = block as IMyFunctionalBlock;
-                            if (functional != null)
+                            GridTerminalSystem.GetBlocks(blocks);
+                            foreach (var block in blocks)
                             {
-                                functional.Enabled = true;
+                                var functional = block as IMyFunctionalBlock;
+                                if (functional != null)
+                                {
+                                    functional.Enabled = true;
+                                }
                             }
-
-                            // Adds Mass
-                            MissileMass += block.Mass;
                         }
-                        foreach (var thruster in _thrusters)
+
+                        // Calculate mass and thrust (first time)
+                        if (_ticks == 20)
                         {
-                            //Adds Force Component (Forwards Only)
-                            double ThisThrusterThrust = thruster.MaxThrust;
-                            MissileThrust += ThisThrusterThrust;
+                            MissileMass = 0;
+                            MissileThrust = 0;
+                            GridTerminalSystem.GetBlocks(blocks);
+                            foreach (var block in blocks)
+                            {
+                                MissileMass += block.Mass;
+                            }
+                            foreach (var thruster in _thrusters)
+                            {
+                                MissileThrust += thruster.MaxThrust;
+                            }
                         }
                     }
 
@@ -298,16 +331,18 @@ namespace IngameScript
                     return;
                 }
 
+                // Mass is calculated once during initialization (tick 20)
+                // No need for frequent recalculation
+
                 if (_antiairmode && armtype != "bomb")
                 {
-
+                    // Parse CustomData to update target position (runs every tick at 60Hz for real-time tracking)
                     string customData = programmableBlock.CustomData;
                     string[] lines = customData.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    StringBuilder newCustomData = new StringBuilder();
 
                     foreach (string line in lines)
                     {
-                        if (line.StartsWith("Cached" + ":"))
+                        if (line.StartsWith("Cached:"))
                         {
                             string gpsData = line.Substring(line.IndexOf(':') + 1).Trim();
                             if (!string.IsNullOrEmpty(gpsData))
@@ -319,30 +354,13 @@ namespace IngameScript
                                     _currentWaypointIndex = 0;
                                 }
                             }
+                            break; // Found the Cached line, no need to continue
                         }
                     }
                 }
-                if (_warheads.Count == 0)
-                {
-                    GridTerminalSystem.GetBlocksOfType(_warheads);
-                    if (_warheads.Count == 0)
-                    {
-                        Echo("[ERROR] No warheads found!");
-                        return;
-                    }
-                }
 
-                _sensor = GridTerminalSystem.GetBlockWithName("Sensor") as IMySensorBlock;
-                _sensor.Enabled = true;
-                if (armtype != "bomb")
-                {
-                    radar = GridTerminalSystem.GetBlockWithName("Radar") as IMyLargeGatlingTurret;
-                }
-
-                if (_gyros.Count == 0)
-                {
-                    GridTerminalSystem.GetBlocksOfType(_gyros);
-                }
+                // Blocks are already initialized during startup (ticks 5-10)
+                // No need to re-fetch every tick
 
                 Vector3D currentPos = _remoteControl.GetPosition();
                 Vector3D currentVelocity = _remoteControl.GetShipVelocities().LinearVelocity;
@@ -358,7 +376,7 @@ namespace IngameScript
                 Vector3D _destination = _waypoints[Math.Min(_currentWaypointIndex, _waypoints.Count - 1)];
                 double distanceToTarget = Vector3D.Distance(currentPos, _destination);
 
-                if (armtype != "bomb")
+                if (armtype != "bomb" && radar != null)
                 {
                     radar.Enabled = true;
                     radar.Shoot = true;
@@ -425,9 +443,10 @@ namespace IngameScript
                 Vector3D normalizedTargetDirection = targetdirection.Normalized();
                 double dotProduct = Vector3D.Dot(forwardVector, normalizedTargetDirection);
 
-                double denominator = targetdirection.LengthSquared();
+                // Prevent division by near-zero when very close to target
+                double denominator = Math.Max(targetdirection.LengthSquared(), 100.0); // Minimum 10m distance squared
 
-                instantlosrate = Vector3D.Cross(targetdirection, (currentVelocity - targetvelocity)) / targetdirection.LengthSquared();
+                instantlosrate = Vector3D.Cross(targetdirection, (currentVelocity - targetvelocity)) / denominator;
                 double roll = 0;
                 MatrixD worldMatrix = _remoteControl.WorldMatrix;
                 Vector3D upVector = worldMatrix.Up;
@@ -455,7 +474,7 @@ namespace IngameScript
                 double Vclosing = (TargetVelocity - MissileVelocity).Length();
 
                 Vector3D LateralDirection = Vector3D.Normalize(Vector3D.Cross(Vector3D.Cross(Rel_Vel, LOS_New), Rel_Vel));
-                Vector3D LateralAccelerationComponent = LateralDirection * 5 * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * 5);
+                Vector3D LateralAccelerationComponent = LateralDirection * _navConstant * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * _navConstant);
                 //Calculates Remaining Force Component And Adds Along LOS
 
                 MissileAccel = MissileThrust / MissileMass;
@@ -470,10 +489,18 @@ namespace IngameScript
                 if (double.IsNaN(RejectedAccel)) { RejectedAccel = 0; }
                 LateralAccelerationComponent = LateralAccelerationComponent + LOS_New * RejectedAccel;
                 Vector3D desiredAcceleration = Vector3D.Normalize(LateralAccelerationComponent - gravity);
+
+                // Calculate adaptive gain to reduce oscillation at close range
+                double gainMultiplier = Math.Min(1.0, distanceToTarget / 500.0); // Reduces gain below 500m
+                double adaptiveGain = 18.0 * Math.Max(0.2, gainMultiplier); // Minimum 20% gain (3.6)
+
+                // Calculate adaptive damping - increases as distance decreases
+                double adaptiveDamping = 0.3 * (1.0 + (500.0 / Math.Max(distanceToTarget, 50.0)));
+
                 double Yaw = 0; double Pitch = 0;
                 foreach (var gyro in _gyros)
                 {
-                    GyroTurn6(desiredAcceleration, 18, 0.3, _thrusters[0], gyro as IMyGyro, PREV_Yaw, PREV_Pitch, out Pitch, out Yaw);
+                    GyroTurn6(desiredAcceleration, adaptiveGain, adaptiveDamping, _thrusters[0], gyro as IMyGyro, PREV_Yaw, PREV_Pitch, out Pitch, out Yaw, distanceToTarget);
                 }
                 PREV_Yaw = Yaw;
                 PREV_Pitch = Pitch;
@@ -481,15 +508,23 @@ namespace IngameScript
 
                 //Vector3D desiredAcceleration = 3*Vector3D.Cross(currentVelocity, instantlosrate);
 
-                // --- Use the results ---
-                // Apply thrust based on 'thrustOverride'
-                // Maybe display 'currentMaxSpeed' or use it for other decisions.
+                // --- Smart thrust modulation (50-100% based on alignment) ---
+                // Get missile forward direction (thrusters point backward)
+                Vector3D MissileForwards = _thrusters[0].WorldMatrix.Backward;
+
+                // Calculate how well aligned we are with desired acceleration
+                double ThrustPower = Vector_Projection_Scalar(MissileForwards, Vector3D.Normalize(LateralAccelerationComponent));
+                ThrustPower = MathHelper.Clamp(ThrustPower, 0.5, 1.0); // 50-100% range
+
                 _remoteControl.DampenersOverride = false;
                 foreach (var thruster in _thrusters)
                 {
-
-                    thruster.ThrustOverridePercentage = 1f;
-
+                    // Only update if changed to reduce command overhead
+                    float targetOverride = (float)(thruster.MaxThrust * ThrustPower);
+                    if (Math.Abs(thruster.ThrustOverride - targetOverride) > 0.01f)
+                    {
+                        thruster.ThrustOverride = targetOverride;
+                    }
                 }
                 // Compute the rotation vector
                 // Proceed with rotation and gyro control using desiredAcceleration as calculated
@@ -499,14 +534,16 @@ namespace IngameScript
 
                 _previousTargetPoS = targetPosition;
                 _oldmissilePos = _remoteControl.GetPosition();
-                if (lcdMain != null)
+
+                // Update LCD at 20Hz (every 3 ticks) instead of 60Hz for performance
+                if (lcdMain != null && _ticks % 3 == 0)
                 {
-                    DisplayOnLCD(lcdMain, distanceToTarget, startingDistance, speed, _ticks, desiredAcceleration, desiredAcceleration);
+                    DisplayOnLCD(lcdMain, distanceToTarget, startingDistance, speed, _ticks, currentVelocity);
                 }
             }
         }
 
-        void GyroTurn6(Vector3D TARGETVECTOR, double GAIN, double DAMPINGGAIN, IMyTerminalBlock REF, IMyGyro GYRO, double YawPrev, double PitchPrev, out double NewPitch, out double NewYaw)
+        void GyroTurn6(Vector3D TARGETVECTOR, double GAIN, double DAMPINGGAIN, IMyTerminalBlock REF, IMyGyro GYRO, double YawPrev, double PitchPrev, out double NewPitch, out double NewYaw, double distanceToTarget)
         {
             //Pre Setting Factors
             NewYaw = 0;
@@ -544,10 +581,10 @@ namespace IngameScript
             if (double.IsNaN(TRANS_VECT.X) || double.IsNaN(TRANS_VECT.Y) || double.IsNaN(TRANS_VECT.Z))
             { return; }
 
-            //Applies To Scenario
-            GYRO.Pitch = (float)MathHelper.Clamp((-TRANS_VECT.X) * GAIN, -1000, 1000);
-            GYRO.Yaw = (float)MathHelper.Clamp(((-TRANS_VECT.Y)) * GAIN, -1000, 1000);
-            GYRO.Roll = (float)MathHelper.Clamp(((-TRANS_VECT.Z)) * GAIN, -1000, 1000);
+            //Applies To Scenario with reasonable clamps to prevent excessive gyro commands
+            GYRO.Pitch = (float)MathHelper.Clamp((-TRANS_VECT.X) * GAIN, -500, 500);
+            GYRO.Yaw = (float)MathHelper.Clamp(((-TRANS_VECT.Y)) * GAIN, -500, 500);
+            GYRO.Roll = (float)MathHelper.Clamp(((-TRANS_VECT.Z)) * GAIN, -500, 500);
             GYRO.GyroOverride = true;
         }
 
@@ -832,6 +869,16 @@ namespace IngameScript
             }
         }
 
+        // Vector projection scalar helper (from reference implementation)
+        public static double Vector_Projection_Scalar(Vector3D IN, Vector3D Axis_norm)
+        {
+            double OUT = Vector3D.Dot(IN, Axis_norm);
+            if (double.IsNaN(OUT))
+            {
+                OUT = 0;
+            }
+            return OUT;
+        }
 
         void DetonateWarheads()
         {
@@ -849,318 +896,83 @@ namespace IngameScript
                 warhead.Detonate();
             }
         }
-        private const int GridSize = 15; // Must be odd for a clear center. 7x7 grid.
-        private const char EmptyChar = '.';
-        private const char CenterChar = 'O';
-        private const char TargetChar = '*';
-
-        /// <summary>
-        /// Helper method to generate an ASCII art visualization for a single 2D plane.
-        /// (This method remains unchanged from your original provided code)
-        /// </summary>
-        private static string GeneratePlaneVisualization(
-            double val1, char val1AxisLabelPositive, char val1AxisLabelNegative,
-            double val2, char val2AxisLabelPositive, char val2AxisLabelNegative,
-            string planeTitle,
-            char val1DimChar, char val2DimChar)
+        public void DisplayOnLCD(IMyTextPanel lcd, double distanceToTarget, double startingDistance, double currentSpeed, int _ticks, Vector3D currentVelocity)
         {
-            StringBuilder sbPlane = new StringBuilder();
-            char[,] grid = new char[GridSize, GridSize];
-            int center = GridSize / 2;
+            // Calculate time to impact and progress
+            double timeToTargetSec = currentSpeed > 0 ? distanceToTarget / currentSpeed : double.MaxValue;
+            double progress = Math.Max(0, Math.Min((startingDistance - distanceToTarget) / startingDistance, 1.0));
 
-            // Initialize grid
-            for (int r = 0; r < GridSize; r++)
-            {
-                for (int c = 0; c < GridSize; c++)
-                {
-                    grid[r, c] = EmptyChar;
-                }
-            }
-
-            // Mark center
-            grid[center, center] = CenterChar;
-
-            // Calculate target cell coordinates
-            // val1 maps to columns (horizontal), val2 maps to rows (vertical)
-            // For display, +val1 is right, +val2 is up (which means smaller row index)
-            int targetCol = center + (int)Math.Round(val1);
-            int targetRow = center - (int)Math.Round(val2); // Invert val2 for typical screen Y-axis (up is smaller index)
-
-            // Clamp target coordinates to grid boundaries
-            targetCol = Math.Max(0, Math.Min(GridSize - 1, targetCol));
-            targetRow = Math.Max(0, Math.Min(GridSize - 1, targetRow));
-
-            // Mark target if it's not the center
-            if (targetRow != center || targetCol != center)
-            {
-                grid[targetRow, targetCol] = TargetChar;
-            }
-
-            // Build the string representation of the grid
-            sbPlane.AppendLine(planeTitle);
-
-            // Top axis label (for val1)
-            sbPlane.Append("  "); // Indent for vertical axis labels
-            for (int c = 0; c < GridSize; c++)
-            {
-                if (c == 0) sbPlane.Append(val1AxisLabelNegative);
-                else if (c == GridSize - 1) sbPlane.Append(val1AxisLabelPositive);
-                else if (c == center) sbPlane.Append(val1DimChar);
-                else sbPlane.Append(" ");
-            }
-            sbPlane.AppendLine();
-
-            // Grid rows with side axis labels (for val2)
-            for (int r = 0; r < GridSize; r++)
-            {
-                // Side axis label
-                if (r == 0) sbPlane.Append(val2AxisLabelPositive).Append(" ");
-                else if (r == GridSize - 1) sbPlane.Append(val2AxisLabelNegative).Append(" ");
-                else if (r == center) sbPlane.Append(val2DimChar).Append(" ");
-                else sbPlane.Append("  ");
-
-                // Grid content for the current row
-                for (int c = 0; c < GridSize; c++)
-                {
-                    sbPlane.Append(grid[r, c]);
-                }
-                sbPlane.AppendLine();
-            }
-            return sbPlane.ToString();
-        }
-
-        /// <summary>
-        /// Generates a simplified ASCII visualization for desired nose movement (Pitch and Yaw).
-        /// </summary>
-        /// <param name="desiredRotation">The Vector3D to visualize.
-        /// Assumes Y component is Pitch and Z component is Yaw.</param>
-        /// <returns>A string containing the ASCII visualization for Pitch and Yaw.</returns>
-        public static string GetRotationVisualizationText(Vector3D desiredRotation, Vector3D desiredacc)
-        {
-            StringBuilder result = new StringBuilder();
-            double maxDisplayMagnitude = (GridSize - 1) / 2.0;
-
-            // Assuming desiredRotation.X is Roll, .Y is Pitch, .Z is Yaw
-            double vRoll = desiredRotation.X;
-            double vPitch = desiredRotation.Y;
-            double vYaw = desiredRotation.Z;
-
-            // Determine the largest component (Pitch or Yaw) to scale if too large for the grid
-            double epsilon = 1e-9;
-            double relevantMaxAbs = 0;
-            if (Math.Abs(vPitch) > epsilon) relevantMaxAbs = Math.Max(relevantMaxAbs, Math.Abs(vPitch));
-            if (Math.Abs(vYaw) > epsilon) relevantMaxAbs = Math.Max(relevantMaxAbs, Math.Abs(vYaw));
-
-            double scaleFactor = 1.0;
-            if (relevantMaxAbs > epsilon && relevantMaxAbs > maxDisplayMagnitude)
-            {
-                scaleFactor = maxDisplayMagnitude / relevantMaxAbs;
-            }
-
-            double displayPitch = vPitch * scaleFactor;
-            double displayYaw = vYaw * scaleFactor;
-
-            result.AppendLine("Desired Nose Movement (O=Origin, *=Target):");
-            result.AppendLine($"Input Rotation: Roll={vRoll:F2}, Pitch={vPitch:F2}, Yaw={vYaw:F2}");
-            result.AppendLine($"Input Speed: X={desiredacc.X:F2}, Y={desiredacc.Y:F2}, Z={desiredacc.Z:F2}");
-            if (Math.Abs(scaleFactor - 1.0) > epsilon) // Only show scaling info if actually scaled
-            {
-                result.AppendLine($"Scaled for Display (Factor: {scaleFactor:F2}): dPitch={displayPitch:F2}, dYaw={displayYaw:F2}");
-            }
-            else
-            {
-                result.AppendLine($"Display Values: Pitch={displayPitch:F2}, Yaw={displayYaw:F2}");
-            }
-            result.AppendLine();
-
-            // Visualize Yaw (Left/Right) as val1 (horizontal) and Pitch (Up/Down) as val2 (vertical)
-            // Positive Yaw ('R') to the right, Positive Pitch ('U') upwards on the grid.
-            result.Append(GeneratePlaneVisualization(
-                displayYaw,               // val1 (horizontal: Yaw)
-                'R',                      // val1AxisLabelPositive (Yaw Right)
-                'L',                      // val1AxisLabelNegative (Yaw Left)
-                displayPitch,             // val2 (vertical: Pitch)
-                'U',                      // val2AxisLabelPositive (Pitch Up)
-                'D',                      // val2AxisLabelNegative (Pitch Down)
-                "Nose Aim (U/D: Pitch, L/R: Yaw)",
-                'Y',                      // val1DimChar (Yaw axis identifier)
-                'P'                       // val2DimChar (Pitch axis identifier)
-            ));
-
-            return result.ToString();
-        }
-        public void DisplayOnLCD(IMyTextSurface lcd, double distanceToTarget, double startingDistance, double currentVelocity, int _ticks, Vector3D gyros, Vector3D desiredacc)
-        {
-            int barLength = 25;
-            float fontSize = 0.5f;
-            int quoteScrollingSpeed = 8;
-            int scrollTickDivider = 4;
-            double timeToTargetSec = currentVelocity > 0 ? distanceToTarget / currentVelocity : double.MaxValue;
-
+            // Setup LCD for text display (camera compatible)
             lcd.ContentType = ContentType.TEXT_AND_IMAGE;
-            lcd.FontSize = fontSize;
-            lcd.Alignment = TextAlignment.CENTER;
             lcd.Font = "Monospace";
+            lcd.FontSize = 0.8f;
+            lcd.Alignment = TextAlignment.LEFT;
+            lcd.TextPadding = 2f;
 
-            if (timeToTargetSec <= 2.5)
+            StringBuilder display = new StringBuilder();
+
+            // Header
+            display.AppendLine("=====================================");
+            display.AppendLine("   NYINAH CORP MISSILE CAM");
+            display.AppendLine("=====================================\n");
+
+            // Critical impact warning (last 2.5 seconds)
+            if (timeToTargetSec <= 2.5 && timeToTargetSec > 0.1)
             {
-                if (timeToTargetSec > 0.1)
+                bool flash = (_ticks / 10) % 2 == 0;
+                if (flash)
                 {
-                    int maxExplosionRadius = 20;
-                    double explosionIntensity = (2.5 - (timeToTargetSec - 0.1)) / 2.5;
-                    int currentRadius = (int)(maxExplosionRadius * explosionIntensity);
-                    StringBuilder explosionBuilder = new StringBuilder();
-                    string boomText = "\n                           H A V E   A   N I C E   D A Y!";
-                    explosionBuilder.Append(boomText);
-
-                    for (int y = -maxExplosionRadius; y <= maxExplosionRadius; y++)
-                    {
-                        for (int x = -maxExplosionRadius; x <= maxExplosionRadius; x++)
-                        {
-                            double distanceFromCenter = Math.Sqrt(x * x + y * y);
-                            if (distanceFromCenter < currentRadius)
-                            {
-                                if (distanceFromCenter > currentRadius * 0.7 && distanceFromCenter < currentRadius * 0.9)
-                                    explosionBuilder.Append(ColorToChar(255, 69, 0));
-                                else if (distanceFromCenter > currentRadius * 0.3 && distanceFromCenter < currentRadius * 0.7)
-                                    explosionBuilder.Append(ColorToChar(255, 140, 0));
-                                else if (distanceFromCenter <= currentRadius * 0.3)
-                                    explosionBuilder.Append(ColorToChar(255, 255, 224));
-                                else
-                                    explosionBuilder.Append(ColorToChar(255, 255, 0));
-                            }
-                            else
-                            {
-                                explosionBuilder.Append(' ');
-                            }
-                        }
-                        explosionBuilder.Append('\n');
-                    }
-                    lcd.WriteText(explosionBuilder.ToString(), false);
+                    display.AppendLine("!!! IMPACT IMMINENT !!!");
+                    display.AppendLine($"    {timeToTargetSec:F1} SECONDS");
+                    display.AppendLine("!!! IMPACT IMMINENT !!!");
                 }
                 else
                 {
-                    lcd.WriteText("", false);
+                    display.AppendLine("");
+                    display.AppendLine($">>> {timeToTargetSec:F1} SECONDS <<<");
+                    display.AppendLine("");
                 }
             }
             else
             {
-                string headerText = "NYINAH CORP";
-                string topLeftLabel = "Velocity: ";
-                string topRightLabel = "Time to Impact: ";
-                string bottomLeftLabel = "Distance to Target: ";
-                string bottomRightLabel = "Total Distance at Start: ";
-                string progressLabel = "Progress: ";
-                string target = "Target: Refresh - " + cooldown.ToString();
+                // Normal telemetry display
+                display.AppendLine($"Speed:     {currentSpeed:F0} m/s");
+                display.AppendLine($"Distance:  {distanceToTarget:F0} m");
+
+                if (timeToTargetSec < 999)
+                    display.AppendLine($"ETA:       {timeToTargetSec:F1} sec");
+                else
+                    display.AppendLine("ETA:       ---");
+
+                // Target info
                 if (!detectedEntity.IsEmpty())
-                {
-                    target = "Target: " + detectedEntity.Name;
-                }
-                string centerMessageLabel = " ";
+                    display.AppendLine($"Target:    {detectedEntity.Name}");
+                else
+                    display.AppendLine("Target:    Seeking...");
 
-                // Calculate the progress bar
-                double progress = Math.Max(0, Math.Min((startingDistance - distanceToTarget) / startingDistance, 1.0)); // Progress based on distance covered
-                int filledLength = (int)(barLength * progress);
+                display.AppendLine("");
 
-                // Animation effect: make the progress bar pulse and change color
-                char[] pulseChars = { '=', '#', '*' };
-                char pulseChar = pulseChars[_ticks % pulseChars.Length]; // Rotate between '=', '#', and '*' for pulsing effect
-                string distanceBar = "|" + new string(pulseChar, filledLength) + new string('-', barLength - filledLength) + "|";
+                // Progress bar (25 characters wide)
+                int barLength = 25;
+                int filled = (int)(barLength * progress);
+                string progressBar = "[" + new string('=', filled) + ">" + new string('-', barLength - filled - 1) + "]";
+                display.AppendLine($"Progress:  {progressBar}");
+                display.AppendLine($"           {(progress * 100):F0}%");
 
-                // Spinner animation
-                char[] spinnerChars = { '/', '-', '\\', '|' };
-                char spinner = spinnerChars[_ticks % spinnerChars.Length]; // Rotate spinner for animation
+                display.AppendLine("");
 
-                // Scrolling message (scrolls from right to left)
-                string message = " Nyinah Corp. wishes you a safe and successful mission! ";
-                int scrollIndex = (_ticks / scrollTickDivider) % message.Length; // Slow down the scrolling
-                string scrollingMessage = message.Substring(scrollIndex) + message.Substring(0, scrollIndex);
-
-                // Combined quotes into a single string for scrolling
-                string combinedQuotes = "|| To confine our attention to terrestrial matters would be to limit the human spirit. - Stephen Hawking " +
-                                        "|| That's one small step for man, one giant leap for mankind. - Neil Armstrong " +
-                                        "|| The Earth is the cradle of humanity, but mankind cannot stay in the cradle forever. - Konstantin Tsiolkovsky " +
-                                        "|| We are all made of star-stuff. - Carl Sagan " +
-                                        "|| Space exploration is a force of nature unto itself that no other force in society can rival. - Neil deGrasse Tyson " +
-                                        "|| Houston, we have a problem. - Jim Lovell " +
-                                        "|| I see Earth! It is so beautiful. - Yuri Gagarin " +
-                                        "|| Mars is there, waiting to be reached. - Buzz Aldrin " +
-                                        "|| Mystery creates wonder and wonder is the basis of man's desire to understand. - Neil Armstrong " +
-                                        "|| The important achievement of Apollo was demonstrating that humanity is not forever chained to this planet. - Neil Armstrong " +
-                                        "|| We choose to go to the Moon in this decade and do the other things, not because they are easy, but because they are hard. - John F. Kennedy " +
-                                        "|| Across the sea of space, the stars are other suns. - Carl Sagan " +
-                                        "|| In the long run, a single-planet species will not survive. - Stephen Hawking " +
-                                        "|| Earth is a small town with many neighborhoods in a very big universe. - Ron Garan " +
-                                        "|| The Moon is the first milestone on the road to the stars. - Arthur C. Clarke " +
-                                        "|| There can be no thought of finishing for aiming for the stars. - Dr. Werner von Braun " +
-                                        "|| Space is the breath of art. - Frank Lloyd Wright " +
-                                        "|| The sky is not the limit, it is just the beginning. - Lynne Condell " +
-                                        "|| I don't know what you could say about a day in which you have seen four beautiful sunsets. - John Glenn " +
-                                        "|| Space, the final frontier... - Star Trek " +
-                                        "|| In my opinion, the future of space exploration will belong to the private sector. - Stephen Hawking " +
-                                        "|| The cosmos is within us. We are made of star-stuff. We are a way for the universe to know itself. - Carl Sagan " +
-                                        "|| The nitrogen in our DNA, the calcium in our teeth, the iron in our blood, the carbon in our apple pies were made in the interiors of collapsing stars. We are made of star-stuff. - Carl Sagan " +
-                                        "|| The exploration of space will go ahead, whether we join in it or not. - John F. Kennedy " +
-                                        "|| Do not look at stars as bright spots only. Try to take in the vastness of the universe. - Maria Mitchell " +
-                                        "|| The greatest danger to our future is apathy. - Jane Goodall " +
-                                        "|| It's not the plane, it's the pilot. - Top Gun: Maverick " +
-                                        "|| Never tell me the odds. - Han Solo, Star Wars " +
-                                        "|| Stay on target. - Gold Five, Star Wars " +
-                                        "|| To infinity and beyond! - Buzz Lightyear, Toy Story " +
-                                        "|| I'm not a great pilot, but I can crash with the best of them. - Sgt. Cole, Halo: Combat Evolved " +
-                                        "|| Your journey is long, but the way is prepared. - The Forerunner, Halo " +
-                                        "|| A single dream is more powerful than a thousand realities. - J.R.R. Tolkien " +
-                                        "|| The stars look very different today. - David Bowie " +
-                                        "|| The important thing is not to stop questioning. - Albert Einstein " +
-                                        "|| We're all stories in the end. Just make it a good one. - The Doctor, Doctor Who " +
-                                        "|| There's a starman waiting in the sky. - David Bowie " +
-                                        "|| I find your lack of faith disturbing. - Darth Vader, Star Wars " +
-                                        "|| We're going where no one has gone before. - Star Trek " +
-                                        "|| I don't believe in the no-win scenario. - Captain Kirk, Star Trek " +
-                                        "|| If you want to make an apple pie from scratch, you must first invent the universe. - Carl Sagan " +
-                                        "|| Let's fly! - Top Gun: Maverick " +
-                                        "|| You are here to make a difference. - Unknown " +
-                                        "|| Space... is big. Really big. You just won’t believe how vastly, hugely, mind-bogglingly big it is. - Douglas Adams, The Hitchhiker’s Guide to the Galaxy ";
-
-                int quoteScrollIndex = (_ticks / quoteScrollingSpeed) % combinedQuotes.Length; // Slow scroll even further
-                string scrollingQuote = combinedQuotes.Substring(quoteScrollIndex) + combinedQuotes.Substring(0, quoteScrollIndex);
-
-
-                // Compose the text with decorative elements
-                string header = $"+====== {headerText} {spinner} ======+";
-                string footer = "+======================================================+";
-                string topSeparator = "------------------------------------------------------";
-                string bottomSeparator = "------------------------------------------------------";
-
-                // Center and space the top texts
-                string topLeftText = $"  {topLeftLabel}{currentVelocity.ToString("0.0")} m/s".PadRight(20);
-                string topRightText = $"{topRightLabel}{timeToTargetSec.ToString("0.0")} sec".PadLeft(25) + "  ";
-
-                // Center and space the bottom texts
-                string bottomLeftText = $"  {bottomLeftLabel}{distanceToTarget.ToString("0.0")} m".PadRight(10) + "\n" +
-                                        $"  {target}X{desiredacc.X.ToString("0.00")}Y{desiredacc.Y.ToString("0.00")}Z{desiredacc.Z.ToString("0.00")}".PadRight(10) + "\n" +
-                                        $"  {bottomRightLabel}{startingDistance.ToString("0.0")} m".PadRight(10) + "";
-                string progressText = $"  {progressLabel}{distanceBar}".PadRight(25);
-                string centerMessage = $"  {scrollingMessage} ".PadRight(25);
-                string quoteMessage = $"  {scrollingQuote}".PadRight(25);
-
-                // Render the overlapping X's in ASCII
-
-                // ... [Your existing code to create the final output string] ...
-                string footerWithLogo = $"+======================================================+";
-
-                // Replace asciiArrow with asciiBoxCrosshair and asciiCircle in the final output
-                string output = $"{header}\n{centerMessage}\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n{topSeparator}\n{topLeftText}{topRightText}\n{bottomSeparator}\n{bottomLeftText}\n{progressText}\n{quoteMessage}\n{footerWithLogo}";
-
-                // Display the text on the LCD
-                lcd.WriteText(output, false);
+                // Status
+                if (distanceToTarget < 100)
+                    display.AppendLine("Status:    TERMINAL PHASE");
+                else if (distanceToTarget < 500)
+                    display.AppendLine("Status:    FINAL APPROACH");
+                else
+                    display.AppendLine("Status:    TRACKING");
             }
-        }
 
-        private static char ColorToChar(int r, int g, int b)
-        {
-            const double BIT_SPACING = 255.0 / 7.0;
-            return (char)(0xe100 + ((int)Math.Round(r / BIT_SPACING) << 6) + ((int)Math.Round(g / BIT_SPACING) << 3) + (int)Math.Round(b / BIT_SPACING));
+            display.AppendLine("\n=====================================");
+
+            lcd.WriteText(display.ToString());
         }
 
     }
