@@ -93,6 +93,7 @@ namespace IngameScript
         bool _isInitialized = false;
         bool _antiairmode = false;
         bool _blocksFullyInitialized = false;
+        bool _isTerminalPhase = false;
         Vector3D _previousTargetVelocity = Vector3D.Zero;
         Vector3D _previousTargetPoS = Vector3D.Zero;
         Vector3D targetvelocity = Vector3D.Zero;
@@ -365,6 +366,13 @@ namespace IngameScript
                 Vector3D currentPos = _remoteControl.GetPosition();
                 Vector3D currentVelocity = _remoteControl.GetShipVelocities().LinearVelocity;
 
+                // FIX Issue 3: Initialize previous positions on first guidance frame to avoid huge velocity spikes
+                if (_ticks == 100)
+                {
+                    _oldmissilePos = currentPos;
+                    _previousTargetPoS = targetPosition;
+                }
+
                 Vector3D predictedMissilePos = currentPos + currentVelocity * tickTime;
                 double distanceToWaypoint = Vector3D.Distance(currentPos, _waypoints[_currentWaypointIndex]);
 
@@ -419,7 +427,14 @@ namespace IngameScript
                     }
                 }
 
-
+                // ===== TERMINAL PHASE DISABLED =====
+                // ProNav guidance works all the way to impact - terminal phase was causing
+                // 500m misses due to missing gravity compensation and triggering too early
+                // if (distanceToTarget < (startingDistance * 0.15) && !_isTerminalPhase)
+                // {
+                //     _isTerminalPhase = true;
+                //     Echo("[TERMINAL] Switching to pure pursuit guidance");
+                // }
 
 
                 _remoteControl.IsMainCockpit = true;
@@ -435,64 +450,106 @@ namespace IngameScript
                     return;
                 }
 
-                //Bitch Guidance
-                Vector3D targetPositionchanged = targetPosition + targetvelocity * 0.016;
-                Vector3D targetdirection = targetPositionchanged - currentPos;
-                Vector3D instantlosrate;
-                Vector3D forwardVector = currentVelocity.Normalized();
-                Vector3D normalizedTargetDirection = targetdirection.Normalized();
-                double dotProduct = Vector3D.Dot(forwardVector, normalizedTargetDirection);
-
-                // Prevent division by near-zero when very close to target
-                double denominator = Math.Max(targetdirection.LengthSquared(), 100.0); // Minimum 10m distance squared
-
-                instantlosrate = Vector3D.Cross(targetdirection, (currentVelocity - targetvelocity)) / denominator;
-                double roll = 0;
-                MatrixD worldMatrix = _remoteControl.WorldMatrix;
-                Vector3D upVector = worldMatrix.Up;
-                Vector3D leftVector = worldMatrix.Left;
+                // ===== GUIDANCE CALCULATION =====
                 Vector3D gravity = _remoteControl.GetNaturalGravity();
-                bool inGravity = gravity.LengthSquared() > 0;
-                Vector3D gravityDirection = inGravity ? Vector3D.Normalize(gravity) : Vector3D.Zero;
-                double Global_Timestep = 0.016;
-                Vector3D MissilePosition = _remoteControl.CubeGrid.WorldVolume.Center;
-                Vector3D MissilePositionPrev = _oldmissilePos;
-                Vector3D MissileVelocity = (MissilePosition - MissilePositionPrev) / Global_Timestep;
-
-                Vector3D TargetPosition = targetPositionchanged;
-                Vector3D TargetPositionPrev = _previousTargetPoS;
-                Vector3D TargetVelocity = (TargetPosition - _previousTargetPoS) / Global_Timestep;
-                Vector3D LOS_Delta;
-                Vector3D LOS_Old = Vector3D.Normalize(TargetPositionPrev - MissilePositionPrev);
-                Vector3D LOS_New = Vector3D.Normalize(TargetPosition - MissilePosition);
-                Vector3D Rel_Vel = Vector3D.Normalize(TargetVelocity - MissileVelocity);
-                double LOS_Rate;
-                if (LOS_Old.Length() == 0)
-                { LOS_Delta = new Vector3D(0, 0, 0); LOS_Rate = 0.0; }
-                else
-                { LOS_Delta = LOS_New - LOS_Old; LOS_Rate = LOS_Delta.Length() / Global_Timestep; }
-                double Vclosing = (TargetVelocity - MissileVelocity).Length();
-
-                Vector3D LateralDirection = Vector3D.Normalize(Vector3D.Cross(Vector3D.Cross(Rel_Vel, LOS_New), Rel_Vel));
-                Vector3D LateralAccelerationComponent = LateralDirection * _navConstant * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * _navConstant);
-                //Calculates Remaining Force Component And Adds Along LOS
-
                 MissileAccel = MissileThrust / MissileMass;
-                //If Impossible Solution (ie maxes turn rate) Use Drift Cancelling For Minimum T
-                double OversteerReqt = (LateralAccelerationComponent).Length() / MissileAccel;
-                if (OversteerReqt > 0.98)
-                {
-                    LateralAccelerationComponent = MissileAccel * Vector3D.Normalize(LateralAccelerationComponent + (OversteerReqt * Vector3D.Normalize(-MissileVelocity)) * 40);
-                }
+                Vector3D desiredAcceleration;
+                Vector3D LateralAccelerationComponent;
 
-                double RejectedAccel = Math.Sqrt(MissileAccel * MissileAccel - LateralAccelerationComponent.LengthSquared()); //Accel has to be determined whichever way you slice it
-                if (double.IsNaN(RejectedAccel)) { RejectedAccel = 0; }
-                LateralAccelerationComponent = LateralAccelerationComponent + LOS_New * RejectedAccel;
-                Vector3D desiredAcceleration = Vector3D.Normalize(LateralAccelerationComponent - gravity);
+                if (_isTerminalPhase)
+                {
+                    // FIX Issue 4: LEAD PURSUIT - Predict where target will be at intercept time
+                    Vector3D relativeVelocity = currentVelocity - targetvelocity;
+                    double closingSpeed = Math.Max(1.0, relativeVelocity.Length());
+                    double timeToIntercept = distanceToTarget / closingSpeed;
+
+                    // Predict target position (use targetvelocity if available, otherwise assume stationary)
+                    Vector3D predictedTargetPos = targetPosition + targetvelocity * timeToIntercept;
+                    Vector3D directionToTarget = Vector3D.Normalize(predictedTargetPos - currentPos);
+                    desiredAcceleration = directionToTarget;
+                    LateralAccelerationComponent = desiredAcceleration * MissileAccel;
+                    Echo("[TERMINAL] Lead pursuit active");
+                }
+                else
+                {
+                    // PROPORTIONAL NAVIGATION: Full ProNav guidance with lead
+                    double Global_Timestep = tickTime;
+                    Vector3D MissilePosition = _remoteControl.GetPosition();
+                    Vector3D MissilePositionPrev = _oldmissilePos;
+                    // FIX Issue 2: Use API velocity directly instead of position-derived
+                    Vector3D MissileVelocity = currentVelocity;
+
+                    Vector3D TargetPosition = targetPosition;
+                    Vector3D TargetPositionPrev = _previousTargetPoS;
+                    // FIX Issue 1: Use radar velocity when available, fall back to position-derived
+                    Vector3D TargetVelocity = (targetvelocity.LengthSquared() > 0)
+                        ? targetvelocity
+                        : (TargetPosition - _previousTargetPoS) / Global_Timestep;
+
+                    // LOS vectors (missile to target)
+                    Vector3D LOS_Old = Vector3D.Normalize(TargetPositionPrev - MissilePositionPrev);
+                    Vector3D LOS_New = Vector3D.Normalize(TargetPosition - MissilePosition);
+
+                    // Relative velocity (positive = closing)
+                    Vector3D RelativeVelocity = MissileVelocity - TargetVelocity;
+
+                    // FIX: Closing velocity is dot product with LOS, not total magnitude
+                    double Vclosing = Vector3D.Dot(RelativeVelocity, LOS_New);
+                    if (Vclosing < 1.0) Vclosing = 1.0; // Minimum to avoid division issues
+
+                    // LOS rate calculation
+                    Vector3D LOS_Delta;
+                    double LOS_Rate;
+                    if (LOS_Old.LengthSquared() < 0.5) // Check for valid previous LOS
+                    {
+                        LOS_Delta = Vector3D.Zero;
+                        LOS_Rate = 0.0;
+                    }
+                    else
+                    {
+                        LOS_Delta = LOS_New - LOS_Old;
+                        LOS_Rate = LOS_Delta.Length() / Global_Timestep;
+                    }
+
+                    // Lateral direction: perpendicular to LOS in the plane of rotation
+                    Vector3D LateralDirection;
+                    if (LOS_Delta.LengthSquared() > 1e-10)
+                    {
+                        LateralDirection = Vector3D.Normalize(LOS_Delta);
+                    }
+                    else
+                    {
+                        // Fallback: perpendicular to LOS in plane containing relative velocity
+                        Vector3D perpendicular = Vector3D.Cross(LOS_New, RelativeVelocity);
+                        if (perpendicular.LengthSquared() > 1e-10)
+                            LateralDirection = Vector3D.Normalize(Vector3D.Cross(perpendicular, LOS_New));
+                        else
+                            LateralDirection = Vector3D.Zero;
+                    }
+
+                    // Standard Proportional Navigation: a = N * Vc * LOS_rate
+                    // No strange augmentation terms
+                    LateralAccelerationComponent = LateralDirection * _navConstant * LOS_Rate * Vclosing;
+                    //Calculates Remaining Force Component And Adds Along LOS
+
+                    // If lateral acceleration exceeds available thrust, clamp to maximum
+                    double OversteerReqt = LateralAccelerationComponent.Length() / MissileAccel;
+                    if (OversteerReqt > 0.98)
+                    {
+                        // Simply clamp to max available acceleration in the commanded direction
+                        LateralAccelerationComponent = Vector3D.Normalize(LateralAccelerationComponent) * MissileAccel * 0.98;
+                    }
+
+                    double RejectedAccel = Math.Sqrt(MissileAccel * MissileAccel - LateralAccelerationComponent.LengthSquared()); //Accel has to be determined whichever way you slice it
+                    if (double.IsNaN(RejectedAccel)) { RejectedAccel = 0; }
+                    LateralAccelerationComponent = LateralAccelerationComponent + LOS_New * RejectedAccel;
+                    desiredAcceleration = Vector3D.Normalize(LateralAccelerationComponent - gravity);
+                }
 
                 // Calculate adaptive gain to reduce oscillation at close range
                 double gainMultiplier = Math.Min(1.0, distanceToTarget / 500.0); // Reduces gain below 500m
-                double adaptiveGain = 18.0 * Math.Max(0.2, gainMultiplier); // Minimum 20% gain (3.6)
+                // FIX Issue 5: Increased minimum gain from 20% to 60% for better close-range tracking
+                double adaptiveGain = 18.0 * Math.Max(0.6, gainMultiplier); // Minimum 60% gain (10.8)
 
                 // Calculate adaptive damping - increases as distance decreases
                 double adaptiveDamping = 0.3 * (1.0 + (500.0 / Math.Max(distanceToTarget, 50.0)));
@@ -569,8 +626,8 @@ namespace IngameScript
             NewPitch = ShipForwardElevation;
 
             //Applies Some PID Damping
-            ShipForwardAzimuth = ShipForwardAzimuth + DAMPINGGAIN * ((ShipForwardAzimuth - YawPrev) / 0.016);
-            ShipForwardElevation = ShipForwardElevation + DAMPINGGAIN * ((ShipForwardElevation - PitchPrev) / 0.016);
+            ShipForwardAzimuth = ShipForwardAzimuth + DAMPINGGAIN * ((ShipForwardAzimuth - YawPrev) / tickTime);
+            ShipForwardElevation = ShipForwardElevation + DAMPINGGAIN * ((ShipForwardElevation - PitchPrev) / tickTime);
 
             //Does Some Rotations To Provide For any Gyro-Orientation
             var REF_Matrix = MatrixD.CreateWorld(REF.GetPosition(), (Vector3)ShipForward, (Vector3)ShipUp).GetOrientation();

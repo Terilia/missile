@@ -361,3 +361,12 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# MDK2 local overrides
+*.mdk.local.ini
+
+# Claude Code
+.claude/
+
+# Reference files
+ref/

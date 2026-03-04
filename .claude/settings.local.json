@@ -3,7 +3,9 @@
     "allow": [
       "Bash(dotnet build:*)",
       "Bash(dir /s /b \"C:\\Users\\xerdi\\source\\repos\\Terilia\\missile\\*.cs\")",
-      "Bash(dir \"C:\\Users\\xerdi\\source\\repos\\Terilia\\missile\")"
+      "Bash(dir \"C:\\Users\\xerdi\\source\\repos\\Terilia\\missile\")",
+      "Bash(wc:*)",
+      "Bash(grep:*)"
     ],
     "deny": [],
     "ask": []
