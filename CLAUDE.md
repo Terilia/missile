@@ -4,209 +4,132 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Space Engineers ingame script** project that implements a **Proportional Navigation (ProNav) missile guidance system**. The missile script is designed to work with merge-block launched missiles that receive target GPS coordinates from a controlling script (typically "JETOS Programmable Block").
+Space Engineers ingame script implementing a **Proportional Navigation (ProNav)** missile guidance system. The missile launches off a merge block ("Bay N") and receives target GPS via the launcher's `JETOS Programmable Block` Custom Data. Built with **MDK 2** targeting .NET Framework 4.8 / C# 6 so it can paste into a Programmable Block in-game.
 
-The project uses **MDK 2 (Malware Development Kit)** - a Visual Studio extension and toolchain for developing Space Engineers scripts in C# 6 targeting .NET Framework 4.8.
+## Build
 
-## Build and Development Commands
-
-### Building the Script
 ```bash
 dotnet build missile.sln
 ```
 
-The build process uses MDK 2 packagers that compile the script and prepare it for deployment to Space Engineers. The output is optimized for the game's ingame scripting environment.
+MDK 2 packagers produce the pastable script. Minification is controlled in `missile/missile.mdk.ini` (currently `minify=none`; use `lite`/`full` if script size becomes a problem). `missile/missile.mdk.local.ini` is git-ignored for local overrides. There is no test harness — validation requires running in Space Engineers.
 
-### Project Configuration
-- Target Framework: .NET Framework 4.8
-- Language: C# 6
-- Platform: x64
-- MDK Configuration: `missile/missile.mdk.ini`
-- Local overrides (git-ignored): `missile/missile.mdk.local.ini`
+## Code Layout
 
-### Minification Settings
-Controlled in `missile/missile.mdk.ini`:
-- Currently set to `minify=none` (no minification)
-- Options: `none`, `trim`, `stripcomments`, `lite`, `full`
-- For production deployment, consider using `lite` or `full` to reduce script size
+`Program` is a single `partial class` split across files by responsibility. When adding state, add fields to `MissileState.cs` — everything else assumes they live there.
 
-## Architecture and Code Structure
+- `Program.cs` — `Main()` only: the tick-driven state machine and the ProNav loop.
+- `MissileState.cs` — all fields, constants (`WAYPOINT_THRESHOLD`, `DETONATION_DISTANCE`, `tickTime`), and `_navConstant`.
+- `Initialization.cs` — `Initialize()`, `CheckForGPSAndStart()` (parses launcher Custom Data), `InitializeThrusters()`, `FindClosestMergeBlock()`, `GetBayNumberFromMergeBlock()`.
+- `Guidance.cs` — `GyroTurn6()` (quaternion-based gyro steering, used by the live loop) and `ApplyGyroOverride()` (legacy/startup orientation helper).
+- `Detonation.cs` — `PerformRaycastCheck()` (3 m ProxCam raycast) and `DetonateWarheads()`.
+- `Waypoints.cs` — `TryParseGPS()` and `AddLoftedTrajectoryWaypoints()`.
+- `VectorMath.cs` — `Vector_Projection_Scalar()` used for thrust alignment, plus a nested `VectorMath` static class with `Projection`/`Reject`.
+- `Display.cs` — `DisplayOnLCD()` telemetry writer (runs every 3 ticks).
 
-### Missile Launch and Initialization Flow
+## Tick-Driven State Machine
 
-1. **Pre-Launch State**: Missile sits on launcher, attached via merge block named "Bay X" where X is the bay number
-2. **Initialization** (Main loop, `!_isInitialized`):
-   - Finds closest merge block with "Bay" in name on own grid
-   - Extracts bay number from merge block name (e.g., "Bay 1" → `_bayNumber = 1`)
-   - Sets `_isInitialized = true`
-3. **Waiting for Launch** (`_isInitialized && !_isStarted`):
-   - Calls `CheckForGPSAndStart()` which:
-     - Reads Custom Data from "JETOS Programmable Block" on launcher grid
-     - Parses `Topdown:true/false` flag (enables lofted trajectory)
-     - Parses `AntiAir:true/false` flag (enables continuous target updates)
-     - Searches for line matching bay number format: `<BayNumber>:GPS:Target:X:Y:Z:#Color:`
-     - Once GPS found, populates `_waypoints`, disconnects merge block, sets `_isStarted = true`
-4. **Active Guidance** (`_isStarted`):
-   - Ticks 0-100: Initialization phase (find blocks, enable systems, calculate lofted waypoints if topdown mode)
-   - Tick 100+: Full guidance loop runs every frame (60 FPS)
+`Runtime.UpdateFrequency = Update1` (every frame, 60 Hz). `Main()` branches on two flags set in order:
 
-### Guidance Algorithm (PN with Augmentation)
+1. **`!_isInitialized`** — every 5 ticks, search own grid for a merge block whose name starts with "Bay", extract the trailing digits as `_bayNumber`, set `_isInitialized`, return.
+2. **`_isInitialized && !_isStarted`** — `CheckForGPSAndStart()` reads `JETOS Programmable Block` Custom Data: parses `Topdown:`, `AntiAir:`, and the line starting with `<bayNumber>:`. On a valid GPS parse, seeds `_waypoints`, disables the merge block, resets `_ticks = 0`, sets `_isStarted`. In anti-air mode, the bay's GPS line is cleared from Custom Data so it won't be re-read.
+3. **`_isStarted` tick 0–99** — staged hardware init. Block lookups happen in the 4 < tick < 10 window (remote control, radar, LCD, sensor, warheads, gyros, thrusters; thrusters are filtered by name containing `"Sci-Fi"` unless `armtype == "bomb"`). The gravity-aware uplift orientation runs 15 < tick < 30. `MissileMass` and `MissileThrust` are computed once at tick 20. Lofted waypoints (if `isTopdown`) are inserted at tick ~5–10.
+4. **`_isStarted` tick ≥ 100** — full guidance loop, every frame.
 
-The core guidance is in the Main loop starting at line 421. Key calculations:
+The guidance loop lives in `Main()` (`Program.cs`) — it is not extracted into a method. Anti-air mode re-parses the launcher's `Cached:` GPS line every tick and rewrites the final waypoint.
 
-1. **Line-of-Sight Rate**: Calculates instantaneous LOS rate using cross product: `Cross(targetdirection, (currentVelocity - targetvelocity)) / targetdirection.LengthSquared()`
+## ProNav Guidance (Program.cs)
 
-2. **Lateral Acceleration**:
-   ```
-   LateralAccelerationComponent = LateralDirection * 5 * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * 5)
-   ```
-   This is a PN law with navigation constant of 5.
+The current algorithm is **standard PN** — prior augmentation/drift-cancel terms were deliberately removed (see comments "No strange augmentation terms" and the disabled terminal-phase block).
 
-3. **Oversteer Correction**: If lateral acceleration exceeds 98% of missile's max acceleration, the algorithm adds drift cancellation to maintain minimum intercept time.
+```
+Vclosing   = max(1.0, dot(MissileVelocity - TargetVelocity, LOS_New))
+LOS_Rate   = |LOS_New - LOS_Old| / dt
+Lateral    = LateralDir * _navConstant * LOS_Rate * Vclosing      // N · Vc · σ̇
+```
 
-4. **Axial Acceleration**: Remaining thrust after lateral maneuver is projected along LOS for closure.
+Key details:
+- `_navConstant` defaults to **4.0** in `MissileState.cs`, overridden to **9.0** when `armtype == "bomb"` at the top of `Main()`.
+- `TargetVelocity` prefers radar `detectedEntity.Velocity`; falls back to finite-difference from `_previousTargetPoS`. Zero is only used if nothing is known.
+- `LateralDirection` defaults to `normalize(LOS_Delta)`; degenerate case falls back to `Cross(Cross(LOS, RelVel), LOS)`.
+- **Oversteer**: if `|Lateral| / MissileAccel > 0.98`, clamp to `0.98 * MissileAccel` in the commanded direction (no drift cancellation — this is a simpler clamp than older versions).
+- Remaining accel budget is allocated along `LOS_New` via `sqrt(MissileAccel² - |Lateral|²)`.
+- Final `desiredAcceleration = normalize(Lateral + LOS·rejected − gravity)` — gravity compensation is baked into the desired direction.
+- There is a `_isTerminalPhase` branch for lead pursuit, but the switch that would set it is **commented out**. Treat terminal phase as dead code unless re-enabled.
 
-5. **Gyro Control**: `GyroTurn6()` function (line 509) converts desired acceleration vector to gyro pitch/yaw/roll commands with PID damping.
+**Gyro control** uses `GyroTurn6()` with **adaptive gain and damping** computed per-frame:
 
-### Target Tracking Modes
+```
+gainMultiplier  = min(1.0, distanceToTarget / 500.0)
+adaptiveGain    = 18.0 * max(0.6, gainMultiplier)                 // floor raised to 60%
+adaptiveDamping = 0.3 * (1.0 + 500.0 / max(distanceToTarget, 50.0))
+```
 
-**Standard Mode** (`_antiairmode = false`):
-- Target is static GPS coordinate from launcher's Custom Data
-- Waypoints fixed at launch time
+`GyroTurn6()` converts the desired world vector into RC-local azimuth/elevation via inverse quaternion, applies PID damping against `PREV_Yaw`/`PREV_Pitch`, then transforms into each gyro's local frame. Outputs are clamped to `[-500, 500]`.
 
-**Anti-Air Mode** (`_antiairmode = true`, `armtype != "bomb"`):
-- Continuously reads `Cached:GPS:` line from launcher's Custom Data
-- Updates final waypoint each frame to track moving targets
-- Uses onboard radar (IMyLargeGatlingTurret named "Radar") to detect and refine target position
-- If radar locks target, uses `detectedEntity.Position` and `detectedEntity.Velocity` for guidance
+**Thrust modulation**: thrusters are no longer pinned at 100%. Each frame:
 
-**Topdown Mode** (`isTopdown = true`, set via launcher Custom Data):
-- Calls `AddLoftedTrajectoryWaypoints()` once after initialization
-- Inserts intermediate waypoint at fraction (default 0.5) of horizontal distance, elevated by `loftHeight` (default 9000m)
-- Missile climbs to loft point, then descends onto target
+```
+ThrustPower = clamp(dot(MissileForwards, normalize(Lateral)), 0.5, 1.0)
+```
 
-**Bomb Mode** (`armtype = "bomb"`):
-- Sets higher navigation constant (`_navConstant = 9.0`)
-- Disables radar and LCD
-- Different thruster filtering logic (skips "Sci-Fi" named thrusters)
+so thrust scales 50–100% by alignment with the commanded accel vector. `_remoteControl.DampenersOverride` is forced `false`.
 
-### Block Naming Conventions (Critical for Operation)
+## Target Tracking Modes
 
-The script expects specific block names on the missile grid:
-- `"Remote Control Missile"` - IMyRemoteControl (required)
-- `"Bay X"` - IMyShipMergeBlock where X is bay number (required, e.g., "Bay 1", "Bay 2")
-- `"Sci-Fi"` - Thrusters containing this substring are used for main propulsion (not in bomb mode)
-- `"Radar"` - IMyLargeGatlingTurret for target detection (anti-air mode)
-- `"ProxCam"` - IMyCameraBlock for proximity detonation (optional)
-- `"Holo LCD"` - IMyTextSurface for status display (optional, not in bomb mode)
-- `"Sensor"` - IMySensorBlock (required but may be legacy/unused)
+- **Standard** (`_antiairmode=false`) — static waypoint from launch.
+- **Anti-Air** (`_antiairmode=true`, `armtype!="bomb"`) — every tick, re-parse `Cached:` line and overwrite final waypoint. Also drives the onboard `"Radar"` turret: fires `ShootOnce()` every 150-tick cooldown when no lock and within 6000 m; on lock, uses `detectedEntity.Position/Velocity`.
+- **Topdown** (`isTopdown=true`) — `AddLoftedTrajectoryWaypoints()` inserts a waypoint at `0.5 * horizontalDistance` elevated by `9000 m` against gravity. Gravity-required; logs and skips in vacuum. Only runs when `!_antiairmode && armtype!="bomb"`.
+- **Bomb** (`armtype="bomb"`) — `_navConstant=9.0`, radar/LCD skipped, thruster filter skipped (no `"Sci-Fi"` requirement), raycast detonation disabled.
+
+## Block Naming (required for operation)
+
+On the missile grid:
+- `Remote Control Missile` — `IMyRemoteControl` (required; throws if missing)
+- `Bay <N>` — `IMyShipMergeBlock`, digits parsed as bay number
+- Thrusters named containing `Sci-Fi` — main propulsion (non-bomb mode)
+- `Radar` — `IMyLargeGatlingTurret` (anti-air)
+- `ProxCam` — `IMyCameraBlock` (optional proximity fuse)
+- `Holo LCD` — `IMyTextPanel` (optional telemetry)
+- `Sensor` — `IMySensorBlock` (enabled at init; no current consumer)
 
 On the launcher grid:
-- `"JETOS Programmable Block"` - IMyProgrammableBlock that provides target GPS via Custom Data
+- `JETOS Programmable Block` — target provider (required)
 
-### Custom Data Format (Launcher → Missile Communication)
+## Launcher Custom Data Format
 
-The launcher's Programmable Block Custom Data must contain:
 ```
 Topdown:true
 AntiAir:false
-1:GPS:Target:12345.6:67890.1:-23456.7:#FF0000:
-2:GPS:Target:98765.4:43210.9:-87654.3:#00FF00:
-Cached:GPS:LiveTarget:11111.1:22222.2:33333.3:#0000FF:
+1:GPS:Target:X:Y:Z:#RRGGBB:
+2:GPS:Target:X:Y:Z:#RRGGBB:
+Cached:GPS:Live:X:Y:Z:#RRGGBB:
 ```
 
-- `Topdown:` - Boolean flag for lofted trajectory
-- `AntiAir:` - Boolean flag for continuous target updates
-- `<BayNumber>:GPS:...` - Target assignment per bay
-- `Cached:GPS:...` - Live target position (anti-air mode only)
+`TryParseGPS` does a `:`-split and reads parts `[2]`, `[3]`, `[4]` as X, Y, Z. No error handling beyond "skip line" — malformed entries silently fail.
 
-After the missile reads its target, it clears its bay line in anti-air mode to prevent re-reads.
+## Detonation
 
-### Detonation Logic
+Triggers:
+1. `distanceToTarget <= DETONATION_DISTANCE` (8 m).
+2. `distanceToTarget < 500` **and** `PerformRaycastCheck()` (3 m ProxCam ray hits something).
+3. Manual: running the PB with argument `"detonate"`.
 
-Warheads detonate when:
-1. Distance to final waypoint ≤ `DETONATION_DISTANCE` (8.0m)
-2. Proximity camera raycast hits object within 3m (if distance < 500m)
-3. Manual trigger via `"detonate"` argument to programmable block
+`DetonateWarheads()` lazily re-fetches warheads if the cached list is empty.
 
-### Thrust Management
+## Tuning Knobs (things to touch first)
 
-Full thrust (100%) is applied to all main thrusters once guidance starts (line 491). Earlier iterations had dynamic thrust logic but current version uses constant full thrust. The missile relies on gyro steering for maneuverability.
+- `_navConstant` (`MissileState.cs`) — pursuit aggressiveness. 4 for missile, 9 for bomb.
+- `GAIN` base `18.0` and `DAMPINGGAIN` base `0.3` (in `Main()` before `GyroTurn6` call) — gyro response/damping. Both are now scaled adaptively by distance.
+- `WAYPOINT_THRESHOLD` (550 m), `DETONATION_DISTANCE` (8 m) in `MissileState.cs`.
+- Loft `fraction=0.5`, `loftHeight=9000` are `AddLoftedTrajectoryWaypoints()` default parameters.
+- LCD cadence: every 3 ticks (`_ticks % 3 == 0`) in the loop tail.
 
-## Important Implementation Notes
+## Constraints and Gotchas
 
-### Vector Math Utilities
-- Custom `VectorMath` class (line 818) provides `Projection()` and `Reject()` for vector operations
-- Used in lofted trajectory calculations to separate horizontal/vertical components
-
-### Frame Rate Assumptions
-- Script assumes 60 FPS (`tickTime = 1f / 60f`, `Global_Timestep = 0.016`)
-- Constructor sets `Runtime.UpdateFrequency = UpdateFrequency.Update1` (every frame)
-- This is critical for guidance accuracy - do not change update frequency
-
-### Coordinate System Transformations
-The guidance algorithm transforms vectors between multiple reference frames:
-1. World space (GPS coordinates)
-2. Remote Control reference frame
-3. Individual gyro reference frames
-
-`GyroTurn6()` performs these transformations using quaternions for precision.
-
-### Performance Considerations
-- All block searches (`GridTerminalSystem.GetBlocksOfType`) are cached after first tick
-- LCD updates and radar operations only occur after tick 100 to reduce initialization lag
-- String parsing of Custom Data happens only once at launch (except in anti-air mode)
-
-## Common Development Scenarios
-
-### Adjusting Guidance Aggressiveness
-- Change `_navConstant` (line 81, default 5.0) - higher values = more aggressive pursuit
-- Modify GAIN parameter in `GyroTurn6()` call (line 476, default 18) - higher = faster rotation response
-- Adjust DAMPINGGAIN in `GyroTurn6()` call (line 476, default 0.3) - higher = more damping, reduces oscillation
-
-### Adding New Waypoint Behaviors
-- Waypoints are stored in `List<Vector3D> _waypoints`
-- Current waypoint index is `_currentWaypointIndex`
-- Waypoint switching logic at line 353: switches when within `WAYPOINT_THRESHOLD` (550m)
-- Insert new waypoints before final target to create flight paths
-
-### Modifying Detonation Behavior
-- Change `DETONATION_DISTANCE` constant (line 79, default 8.0m)
-- Modify proximity raycast distance in `PerformRaycastCheck()` (line 638, default 3.0m)
-- Add additional detonation conditions in Main loop around line 408-418
-
-### Debugging and Telemetry
-- LCD display function `DisplayOnLCD()` (line 992) shows extensive telemetry
-- Includes distance, velocity, time-to-impact, progress bar, scrolling quotes
-- Special "explosion" animation when time-to-impact < 2.5 seconds
-- Can add custom telemetry by modifying the output string composition
-
-## Known Limitations and Edge Cases
-
-1. **Single Thruster Direction**: Assumes all main thrusters point in same direction (forward). Multi-directional thrust vectoring not supported.
-
-2. **Gravity Assumption**: Lofted trajectory assumes single gravity source. May behave incorrectly near multiple planets/moons.
-
-3. **Target Velocity Estimation**: In non-anti-air mode, target velocity is assumed zero. For moving targets without radar, use anti-air mode.
-
-4. **Merge Block Detection**: If multiple merge blocks with "Bay" in name exist, script chooses closest to programmable block. Ensure unique naming.
-
-5. **Custom Data Parsing**: Simple string splitting, no error handling for malformed GPS. Invalid data causes mission failure.
-
-6. **Radar Lock Loss**: If radar loses lock in anti-air mode, missile continues to last known position. No re-acquisition logic beyond periodic shots.
-
-## Testing Workflow
-
-Since this is an ingame script, testing requires Space Engineers:
-
-1. Build the script with `dotnet build`
-2. Copy output from build directory (or use MDK auto-deploy if configured)
-3. Paste into Programmable Block in Space Engineers
-4. Set up test missile with required blocks (see Block Naming Conventions)
-5. Set up launcher with JETOS Programmable Block and correct Custom Data format
-6. Trigger merge block disconnect to launch
-
-For code-only validation without game:
-- Syntax checking via build process
-- No unit test framework currently exists
-- Logic validation requires in-game testing
+- 60 Hz is load-bearing (`tickTime = 1/60`, `Global_Timestep = tickTime`). Do not change `UpdateFrequency`.
+- All main thrusters are assumed co-aligned (forward). `_thrusters[0].WorldMatrix.Backward` is used as the missile-forward reference for thrust modulation.
+- `Lofted waypoint` math assumes a single gravity source.
+- Block searches are cached after the tick 4–10 init window; don't move lookups into the hot path.
+- Multiple `Bay N` merge blocks on a grid → the closest one to `Me` wins. Keep names unique per missile.
+- `_isTerminalPhase` currently unreachable — the enabling condition is commented out in `Main()`. Do not assume it runs.
