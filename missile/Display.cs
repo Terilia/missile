@@ -10,6 +10,7 @@ namespace IngameScript
     {
         public void DisplayOnLCD(IMyTextPanel lcd, double distanceToTarget, double startingDistance, double currentSpeed, int _ticks, Vector3D currentVelocity)
         {
+            return;
             // Calculate time to impact and progress
             double timeToTargetSec = currentSpeed > 0 ? distanceToTarget / currentSpeed : double.MaxValue;
             double progress = Math.Max(0, Math.Min((startingDistance - distanceToTarget) / startingDistance, 1.0));
